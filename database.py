@@ -375,6 +375,27 @@ def get_sessions_today():
     )
 
 
+def get_employee_sessions_last_days(emp_id, days=7):
+    """All sessions (open + closed) for this employee in the last N calendar days (LA time)."""
+    la_now    = get_la_now()
+    since_la  = (la_now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    since_utc = since_la.astimezone(timezone.utc)
+    since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
+    return _fetchall(
+        f"""SELECT s.*, j.car FROM sessions s JOIN jobs j ON j.id=s.job_id
+            WHERE s.employee_id={_ph()} AND s.start_time>={_ph()}
+            ORDER BY s.start_time""",
+        emp_id, since)
+
+
+def la_date(val):
+    """Return the LA calendar date for a UTC timestamp, or None on error."""
+    try:
+        return _parse_dt(val).astimezone(LA_TZ).date()
+    except Exception:
+        return None
+
+
 def get_all_jobs_all():
     """All jobs (active + closed), active first, newest first within each group."""
     return _fetchall(
