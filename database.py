@@ -358,6 +358,62 @@ def get_employee_week_hours(emp_id):
         emp_id, since)
 
 
+def get_sessions_today():
+    """All sessions that started today (LA time), joined with employee + job info."""
+    la_now    = get_la_now()
+    since_la  = la_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    since_utc = since_la.astimezone(timezone.utc)
+    since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
+    return _fetchall(
+        f"""SELECT s.*,e.name AS emp_name,e.telegram_id,j.car,j.plate,j.id AS job_id,j.client
+            FROM sessions s
+            JOIN employees e ON e.telegram_id=s.employee_id
+            JOIN jobs j ON j.id=s.job_id
+            WHERE s.start_time>={_ph()}
+            ORDER BY s.start_time""",
+        since,
+    )
+
+
+def get_all_jobs_all():
+    """All jobs (active + closed), active first, newest first within each group."""
+    return _fetchall(
+        "SELECT * FROM jobs "
+        "ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, created_at DESC"
+    )
+
+
+def get_job_session_count(job_id):
+    """Number of sessions (open or closed) for a job."""
+    row = _fetchone(f"SELECT COUNT(*) AS cnt FROM sessions WHERE job_id={_ph()}", job_id)
+    return int(row["cnt"]) if row else 0
+
+
+def delete_job(job_id):
+    """Delete all sessions for a job, then delete the job itself."""
+    _run(f"DELETE FROM sessions WHERE job_id={_ph()}", job_id)
+    _run(f"DELETE FROM jobs WHERE id={_ph()}", job_id)
+
+
+def update_session_start(session_id, new_start_utc_str):
+    """Update a session's start time. Recalculates duration if session is closed."""
+    new_start       = datetime.strptime(new_start_utc_str, "%Y-%m-%d %H:%M:%S")
+    new_start_aware = new_start.replace(tzinfo=timezone.utc)
+    db_val          = new_start if DATABASE_URL else new_start_utc_str
+    sess            = get_session(session_id)
+    if not sess:
+        return
+    if sess["end_time"]:
+        end_dt  = _parse_dt(sess["end_time"])
+        minutes = max(0, int((end_dt - new_start_aware).total_seconds() / 60))
+        _run(
+            f"UPDATE sessions SET start_time={_ph()},duration_minutes={_ph()} WHERE id={_ph()}",
+            db_val, minutes, session_id,
+        )
+    else:
+        _run(f"UPDATE sessions SET start_time={_ph()} WHERE id={_ph()}", db_val, session_id)
+
+
 # ── Formatting ────────────────────────────────────────────────────────────────
 
 def fmt_time(val):
