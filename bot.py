@@ -443,6 +443,39 @@ async def daily_report_job(ctx):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# QR photo helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import urllib.parse
+
+async def _send_qr_photo(message, job_id: str, car: str, plate: str, tg_link: str):
+    """
+    Sends the QR code as a photo directly in Telegram.
+    Admin can screenshot and print, or forward to anyone.
+    """
+    encoded  = urllib.parse.quote(tg_link, safe="")
+    qr_image = (
+        f"https://api.qrserver.com/v1/create-qr-code/"
+        f"?size=400x400&data={encoded}&color=0f172a&bgcolor=ffffff&margin=20"
+    )
+    caption = (
+        f"🖨 *QR Sticker — {job_id}*\n"
+        f"🚗 {car}  ·  {plate or '—'}\n\n"
+        f"Screenshot this and print it out.\n"
+        f"Attach to the windshield of the car.\n\n"
+        f"🔗 `{tg_link}`"
+    )
+    try:
+        await message.reply_photo(photo=qr_image, caption=caption, parse_mode="Markdown")
+    except Exception:
+        # Fallback to text if image fails
+        await message.reply_text(
+            f"🔗 *QR link — {job_id}*\n`{tg_link}`",
+            parse_mode="Markdown"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Admin commands
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -518,11 +551,10 @@ async def addjob_works(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📋 *{j['id']}*\n"
         f"🚗 {j['car']}  ·  {j.get('plate') or '—'}\n"
         f"👤 {j.get('client') or '—'}\n"
-        f"🔧 {j.get('works') or '—'}\n\n"
-        f"🔗 *QR link:*\n`{qr_link}`\n\n"
-        f"Run `python generate\\_qr.py` to print the sticker.",
+        f"🔧 {j.get('works') or '—'}",
         parse_mode="Markdown"
     )
+    await _send_qr_photo(update.message, j["id"], j["car"], j.get("plate",""), qr_link)
     return ConversationHandler.END
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -574,11 +606,7 @@ async def cmd_qrlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Job *{job_id}* not found.", parse_mode="Markdown")
         return
     qr_link = f"https://t.me/{BOT_USERNAME}?start={job_id}"
-    await update.message.reply_text(
-        f"🔗 *QR link — {job_id}*\n`{qr_link}`\n\n"
-        f"Run `python generate\\_qr.py {job_id}` to print.",
-        parse_mode="Markdown"
-    )
+    await _send_qr_photo(update.message, job_id, job["car"], job["plate"], qr_link)
 
 
 # ── Staff ─────────────────────────────────────────────────────────────────────
