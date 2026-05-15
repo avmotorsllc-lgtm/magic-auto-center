@@ -804,30 +804,37 @@ def _build_alljobs_page(jobs, page):
     page   = max(0, min(page, pages - 1))
     chunk  = jobs[page * JOBS_PER_PAGE:(page + 1) * JOBS_PER_PAGE]
 
-    lines = [f"📁 *ALL JOBS* — {total} total  (page {page + 1}/{pages})\n"]
+    lines    = [f"📋 *ALL JOBS — {total} total*\n"]
     keyboard = []
 
+    SEP = "━━━━━━━━━━━━━━━━━━━━"
+
     for j in chunk:
+        jid       = j["id"]
         status    = "🟢" if j["status"] == "active" else "🔴"
-        total_min = db.get_job_total_minutes(j["id"])
-        sess_cnt  = db.get_job_session_count(j["id"])
+        total_min = db.get_job_total_minutes(jid)
+        sess_cnt  = db.get_job_session_count(jid)
 
-        line = f"{status} *{j['id']}*  ·  {j['car']}"
+        lines.append(SEP)
+        header = f"{status} *{jid}*  ·  {j['car']}"
         if j.get("plate"):
-            line += f"  ·  {j['plate']}"
-        if j.get("client"):
-            line += f"\n      👤 {j['client']}"
-        if total_min:
-            line += f"  ·  ⏱ {db.fmt_dur(total_min)}"
-        if sess_cnt:
-            line += f"  ({sess_cnt} sessions)"
-        lines.append(line)
+            header += f"  ·  {j['plate']}"
+        lines.append(header)
 
-        row = [InlineKeyboardButton("🔗 QR", callback_data=f"aj_qr_{j['id']}")]
+        detail = f"👤 {j['client'] or 'No client'}"
+        if total_min:
+            detail += f"  ·  ⏱ {db.fmt_dur(total_min)}"
+        if sess_cnt:
+            detail += f"  ·  {sess_cnt} session{'s' if sess_cnt != 1 else ''}"
+        lines.append(detail)
+        lines.append(SEP)
+
+        row = [InlineKeyboardButton(f"🔗 QR: {jid}", callback_data=f"aj_qr_{jid}")]
         if j["status"] == "active":
-            row.append(InlineKeyboardButton("✅ Close", callback_data=f"aj_close_{j['id']}"))
-        row.append(InlineKeyboardButton("🗑 Delete", callback_data=f"aj_del_{j['id']}"))
+            row.append(InlineKeyboardButton(f"✅ Close {jid}", callback_data=f"aj_close_{jid}"))
+        row.append(InlineKeyboardButton(f"🗑 Delete {jid}", callback_data=f"aj_del_{jid}"))
         keyboard.append(row)
+        lines.append("")
 
     nav = []
     if page > 0:
@@ -922,17 +929,17 @@ async def handle_alljobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         job_id   = data[len("aj_del_"):]
         job      = db.get_job(job_id)
         sess_cnt = db.get_job_session_count(job_id)
-        warn     = f" and *{sess_cnt}* session(s)" if sess_cnt else ""
         car_str  = job["car"] if job else job_id
         page     = ctx.user_data.get("alljobs_page", 0)
+        warn     = f" This removes *{sess_cnt}* time record(s)." if sess_cnt else ""
         markup   = InlineKeyboardMarkup([[
             InlineKeyboardButton("⚠️ Yes, delete", callback_data=f"aj_del_ok_{job_id}"),
             InlineKeyboardButton("✖ Cancel",        callback_data=f"aj_page_{page}"),
         ]])
         await query.edit_message_text(
-            f"🗑 *Delete {job_id}?*\n\n"
-            f"This will permanently delete *{job_id}* ({car_str}){warn}.\n\n"
-            f"⚠️ Cannot be undone.",
+            f"⚠️ *Delete {job_id} ({car_str})?*\n\n"
+            f"This removes ALL time records.{warn}\n\n"
+            f"Cannot be undone.",
             parse_mode="Markdown", reply_markup=markup,
         )
         return
