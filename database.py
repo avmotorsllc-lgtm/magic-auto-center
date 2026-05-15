@@ -377,6 +377,14 @@ def fmt_dur(minutes):
     return f"{h}h {m}min" if h else f"{m} min"
 
 
+def elapsed_minutes(start_val):
+    """Minutes elapsed since a UTC timestamp."""
+    try:
+        return max(0, int((_now() - _parse_dt(start_val)).total_seconds() / 60))
+    except Exception:
+        return 0
+
+
 def live_dur(start_val):
     try:
         minutes = int((_now() - _parse_dt(start_val)).total_seconds() / 60)
