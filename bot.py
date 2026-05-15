@@ -1,26 +1,37 @@
 """
 bot.py — Magic Auto Center | Telegram Time Tracker
-Features: persistent DB, reply keyboard for admins, live session time,
-parallel session detection, auto-close, evening reminders.
+Technicians scan QR codes on cars to clock in/out automatically.
 """
+import logging
 import os
 import urllib.parse
-from datetime import datetime, time
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from datetime import time
+
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton,
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ConversationHandler, CallbackQueryHandler,
-    ContextTypes, filters
+    ContextTypes, filters,
 )
+
 import database as db
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 TOKEN        = os.environ["BOT_TOKEN"]
 ADMIN_IDS    = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "")
-REMINDER_HOUR   = int(os.environ.get("REMINDER_HOUR", "22"))
-AUTO_CLOSE_HOUR = int(os.environ.get("AUTO_CLOSE_HOUR", "23"))
-REPORT_HOUR     = int(os.environ.get("REPORT_HOUR", "23"))
+REMINDER_HOUR   = int(os.environ.get("REMINDER_HOUR",   "22"))   # UTC
+AUTO_CLOSE_HOUR = int(os.environ.get("AUTO_CLOSE_HOUR", "23"))   # UTC
+REPORT_HOUR     = int(os.environ.get("REPORT_HOUR",     "15"))   # UTC (≈ 8 AM PT)
 
 BRAND = "🔧 Magic Auto Center"
 
@@ -28,41 +39,66 @@ BRAND = "🔧 Magic Auto Center"
  ADD_JOB_CLIENT, ADD_JOB_WORKS,
  WAITING_NAME, EDITING_SESSION_TIME) = range(7)
 
-# ── Admin keyboard (shown at bottom of chat) ──────────────────────────────────
+# ── Admin keyboard ─────────────────────────────────────────────────────────────
 ADMIN_KB = ReplyKeyboardMarkup([
-    [KeyboardButton("📋 New Job"),      KeyboardButton("🚗 Active Jobs")],
-    [KeyboardButton("📊 Today Report"), KeyboardButton("📆 Report 7 Days")],
-    [KeyboardButton("⚠️ Open Sessions"), KeyboardButton("👥 Staff")],
+    [KeyboardButton("📋 New Job"),       KeyboardButton("🚗 Active Jobs")],
+    [KeyboardButton("📊 Today Report"),  KeyboardButton("📆 Report 7 Days")],
+    [KeyboardButton("⚠️ Open Sessions"), KeyboardButton("🟢 Who's In")],
+    [KeyboardButton("👥 Staff")],
 ], resize_keyboard=True, input_field_placeholder="Choose an action...")
 
+# Maps button label → logical command name.
+# "📋 New Job" is handled exclusively by job_conv ConversationHandler (not handle_buttons).
 BUTTON_COMMANDS = {
-    "📋 New Job":        "addjob",
     "🚗 Active Jobs":    "jobs",
     "📊 Today Report":   "report_1",
     "📆 Report 7 Days":  "report_7",
     "⚠️ Open Sessions":  "opensessions",
+    "🟢 Who's In":       "active",
     "👥 Staff":          "staff",
 }
+
+# Set of ALL keyboard button labels — used to guard conversation state handlers
+# from accidentally treating a button press as conversational input.
+BUTTON_LABELS = {"📋 New Job"} | set(BUTTON_COMMANDS.keys())
 
 
 def is_admin(uid): return uid in ADMIN_IDS
 
 
-# ── QR photo helper ───────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def notify_admins(bot, text: str, exclude_uid: int = 0):
+    for aid in ADMIN_IDS:
+        if aid == exclude_uid:
+            continue
+        try:
+            await bot.send_message(aid, text, parse_mode="Markdown")
+        except Exception:
+            pass
+
 
 async def _send_qr(msg, job_id, car, plate, tg_link):
     enc = urllib.parse.quote(tg_link, safe="")
-    img = f"https://api.qrserver.com/v1/create-qr-code/?size=400x400&data={enc}&color=0f172a&bgcolor=ffffff&margin=20"
+    img = (f"https://api.qrserver.com/v1/create-qr-code/"
+           f"?size=400x400&data={enc}&color=0f172a&bgcolor=ffffff&margin=20")
     cap = (
         f"🖨 *QR Sticker — {job_id}*\n"
         f"🚗 {car}  ·  {plate or '—'}\n\n"
-        f"Screenshot & print this.\nAttach to the windshield.\n\n"
+        f"Screenshot & print this. Attach to the windshield.\n\n"
         f"🔗 `{tg_link}`"
     )
     try:
         await msg.reply_photo(photo=img, caption=cap, parse_mode="Markdown")
     except Exception:
         await msg.reply_text(f"🔗 *QR — {job_id}*\n`{tg_link}`", parse_mode="Markdown")
+
+
+async def _show_admin_menu(update: Update):
+    await update.message.reply_text(
+        f"*{BRAND}*\n\nUse the buttons below or type commands:",
+        parse_mode="Markdown", reply_markup=ADMIN_KB,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -76,19 +112,16 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if args:
         job_id   = args[0].upper()
         employee = db.get_employee(uid)
-
         if not employee:
             ctx.user_data["pending_job"] = job_id
             await update.message.reply_text(
                 f"{BRAND}\n\n👋 Welcome! You're not registered yet.\n\nWhat's your name?"
             )
             return WAITING_NAME
-
         job = db.get_job(job_id)
         if not job:
             await update.message.reply_text(f"❌ Job *{job_id}* not found.", parse_mode="Markdown")
             return ConversationHandler.END
-
         await _process_scan(update, ctx, employee, job)
         return ConversationHandler.END
 
@@ -99,8 +132,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 f"{BRAND}\n\n👋 Hey, *{employee['name']}*!\n\n"
-                "Scan the QR sticker on a car to clock in or out.\nEverything is automatic ✅",
-                parse_mode="Markdown"
+                "Scan the QR sticker on a car to clock in or out. Everything is automatic ✅",
+                parse_mode="Markdown",
             )
     else:
         await update.message.reply_text(f"{BRAND}\n\n👋 Welcome!\n\nWhat's your name?")
@@ -113,10 +146,9 @@ async def receive_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     uid  = update.effective_user.id
     db.register_employee(uid, name)
-
     await update.message.reply_text(
         f"✅ Registered as *{name}*!\n\nScan any car QR to clock in — fully automatic.",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
     pending = ctx.user_data.pop("pending_job", None)
     if pending:
@@ -138,15 +170,22 @@ async def _process_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE, employee
     if open_s:
         # ── CLOCK OUT ────────────────────────────────────────────────────────
         end_time, minutes = db.close_session(open_s["id"], open_s["start_time"])
-        await update.message.reply_text(
+        msg = (
             f"⏹ *CLOCKED OUT*\n\n"
             f"👤 {employee['name']}\n"
             f"🚗 {job['car']}  ·  {job['plate'] or '—'}\n"
             f"📋 {job['id']}\n\n"
-            f"🕐 Start:    {db.fmt_time(open_s['start_time'])}\n"
-            f"🕐 End:      {db.fmt_time(end_time)}\n"
-            f"⏱ Duration: *{db.fmt_dur(minutes)}*",
-            parse_mode="Markdown"
+            f"🕐 In:  {db.fmt_time(open_s['start_time'])}\n"
+            f"🕐 Out: {db.fmt_time(end_time)}\n"
+            f"⏱ *{db.fmt_dur(minutes)}*"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        await notify_admins(
+            ctx.bot,
+            f"⏹ *Clock Out*\n👤 {employee['name']}\n"
+            f"🚗 {job['car']}  ·  {job['plate'] or '—'}\n"
+            f"📋 {job['id']}  ·  ⏱ {db.fmt_dur(minutes)}",
+            exclude_uid=emp_id,
         )
         return
 
@@ -158,34 +197,41 @@ async def _process_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE, employee
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 f"✅ Clock out of {other['car']} first",
-                callback_data=f"sw_close_{other['id']}_{job['id']}_{emp_id}"
-            )],[
+                callback_data=f"sw_close_{other['id']}_{job['id']}_{emp_id}",
+            )], [
             InlineKeyboardButton(
                 "⚡ I'm working both cars",
-                callback_data=f"sw_both_{job['id']}_{emp_id}"
+                callback_data=f"sw_both_{job['id']}_{emp_id}",
             ),
         ]])
         await update.message.reply_text(
             f"⚠️ *Hold on, {employee['name']}!*\n\n"
             f"You're still clocked in on:\n"
-            f"🚗 *{other['car']}*  ·  {other.get('plate') or other.get('job_id','')}\n"
+            f"🚗 *{other['car']}*  ·  {other.get('plate') or other.get('job_id', '')}\n"
             f"🕐 Since {since}  ({elapsed} ago)\n\n"
             f"What do you want to do?",
-            parse_mode="Markdown", reply_markup=keyboard
+            parse_mode="Markdown", reply_markup=keyboard,
         )
         return
 
     # ── CLOCK IN ─────────────────────────────────────────────────────────────
     start_time = db.open_session(job["id"], emp_id)
-    await update.message.reply_text(
+    msg = (
         f"▶️ *CLOCKED IN*\n\n"
         f"👤 {employee['name']}\n"
         f"🚗 {job['car']}  ·  {job['plate'] or '—'}\n"
         f"📋 {job['id']}\n"
         f"🔧 {job['works'] or '—'}\n\n"
-        f"🕐 Start: {db.fmt_time(start_time)}\n\n"
-        f"_Scan the QR again when you're done._",
-        parse_mode="Markdown"
+        f"🕐 {db.fmt_time(start_time)}\n\n"
+        f"_Scan the QR again when you're done._"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    await notify_admins(
+        ctx.bot,
+        f"▶️ *Clock In*\n👤 {employee['name']}\n"
+        f"🚗 {job['car']}  ·  {job['plate'] or '—'}\n"
+        f"📋 {job['id']}  ·  🕐 {db.fmt_time(start_time)}",
+        exclude_uid=emp_id,
     )
 
 
@@ -206,12 +252,13 @@ async def handle_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         start_time = db.open_session(new_job_id, emp_id)
         await query.edit_message_text(
             f"✅ *Done!*\n\n"
-            f"⏹ Clocked out of *{old_s['job_id']}* ({db.fmt_dur(old_min)})\n\n"
+            f"⏹ Clocked out of *{old_s['job_id']}*  ({db.fmt_dur(old_min)})\n\n"
             f"▶️ *CLOCKED IN*\n"
             f"🚗 {new_j['car']}  ·  {new_j['plate'] or '—'}\n"
             f"📋 {new_job_id}  ·  🕐 {db.fmt_time(start_time)}",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
+
     elif parts[1] == "both":
         new_job_id, emp_id = parts[2], int(parts[3])
         new_j = db.get_job(new_job_id)
@@ -226,28 +273,19 @@ async def handle_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🚗 {new_j['car']}  ·  {new_j['plate'] or '—'}\n"
             f"📋 {new_job_id}  ·  🕐 {db.fmt_time(start_time)}\n\n"
             f"_Scan each QR separately to clock out of each car._",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Admin menu & keyboard buttons
+# Admin keyboard buttons
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _show_admin_menu(update: Update):
-    await update.message.reply_text(
-        f"*{BRAND}*\n\nUse the buttons below or type commands:",
-        parse_mode="Markdown",
-        reply_markup=ADMIN_KB
-    )
-
-
 async def handle_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Routes keyboard button taps to the right function."""
+    """Routes keyboard button taps. '📋 New Job' is handled by job_conv instead."""
     if not is_admin(update.effective_user.id):
         return
-    text = update.message.text
-    cmd  = BUTTON_COMMANDS.get(text)
+    cmd = BUTTON_COMMANDS.get(update.message.text)
     if cmd == "jobs":
         await cmd_jobs(update, ctx)
     elif cmd == "report_1":
@@ -256,6 +294,8 @@ async def handle_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _send_report(update, 7)
     elif cmd == "opensessions":
         await cmd_opensessions(update, ctx)
+    elif cmd == "active":
+        await cmd_active(update, ctx)
     elif cmd == "staff":
         await cmd_staff(update, ctx)
 
@@ -263,6 +303,100 @@ async def handle_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if is_admin(update.effective_user.id):
         await _show_admin_menu(update)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Add Job conversation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def cmd_addjob(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    ctx.user_data.pop("new_job", None)
+    await update.message.reply_text(
+        "*New Repair Order*\n\nStep 1/5 — RO number:\n_(e.g. RO-1043)_\n\n"
+        "_Type /cancel to stop._",
+        parse_mode="Markdown",
+    )
+    return ADD_JOB_ID
+
+
+async def addjob_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text in BUTTON_LABELS:
+        await update.message.reply_text(
+            "Please type the RO number (e.g. RO-1043), or /cancel to stop.")
+        return ADD_JOB_ID
+    job_id = text.upper()
+    if db.get_job(job_id):
+        await update.message.reply_text(
+            f"⚠️ *{job_id}* already exists. Enter a different RO number:", parse_mode="Markdown")
+        return ADD_JOB_ID
+    ctx.user_data["new_job"] = {"id": job_id}
+    await update.message.reply_text(
+        f"✅ {job_id}\n\nStep 2/5 — Make & model:\n_(e.g. BMW X5)_", parse_mode="Markdown")
+    return ADD_JOB_CAR
+
+
+async def addjob_car(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text in BUTTON_LABELS:
+        await update.message.reply_text("Please type the make & model, or /cancel.")
+        return ADD_JOB_CAR
+    ctx.user_data["new_job"]["car"] = text
+    await update.message.reply_text("Step 3/5 — License plate:\n_(or /skip)_", parse_mode="Markdown")
+    return ADD_JOB_PLATE
+
+
+async def addjob_plate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text in BUTTON_LABELS:
+        await update.message.reply_text("Please type the license plate, or /skip.")
+        return ADD_JOB_PLATE
+    ctx.user_data["new_job"]["plate"] = "" if text.lower() == "/skip" else text.upper()
+    await update.message.reply_text("Step 4/5 — Customer name:\n_(or /skip)_", parse_mode="Markdown")
+    return ADD_JOB_CLIENT
+
+
+async def addjob_client(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text in BUTTON_LABELS:
+        await update.message.reply_text("Please type the customer name, or /skip.")
+        return ADD_JOB_CLIENT
+    ctx.user_data["new_job"]["client"] = "" if text.lower() == "/skip" else text
+    await update.message.reply_text(
+        "Step 5/5 — Work description:\n_(e.g. Front bumper repaint, hood dent)_\n_(or /skip)_",
+        parse_mode="Markdown",
+    )
+    return ADD_JOB_WORKS
+
+
+async def addjob_works(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text in BUTTON_LABELS:
+        await update.message.reply_text("Please type the work description, or /skip.")
+        return ADD_JOB_WORKS
+    j = ctx.user_data.pop("new_job", {})
+    j["works"] = "" if text.lower() == "/skip" else text
+    db.add_job(j["id"], j["car"], j.get("plate", ""), j.get("client", ""), j.get("works", ""))
+    qr_link = f"https://t.me/{BOT_USERNAME}?start={j['id']}"
+    await update.message.reply_text(
+        f"✅ *Job created!*\n\n"
+        f"📋 *{j['id']}*\n"
+        f"🚗 {j['car']}  ·  {j.get('plate') or '—'}\n"
+        f"👤 {j.get('client') or '—'}\n"
+        f"🔧 {j.get('works') or '—'}",
+        parse_mode="Markdown", reply_markup=ADMIN_KB,
+    )
+    await _send_qr(update.message, j["id"], j["car"], j.get("plate", ""), qr_link)
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.pop("new_job", None)
+    ctx.user_data.pop("editing_session_id", None)
+    await update.message.reply_text("❌ Cancelled.", reply_markup=ADMIN_KB)
+    return ConversationHandler.END
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -274,7 +408,8 @@ async def cmd_opensessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     sessions = db.get_all_open_sessions()
     if not sessions:
-        await update.message.reply_text("✅ No open sessions — everyone is clocked out.", reply_markup=ADMIN_KB)
+        await update.message.reply_text(
+            "✅ No open sessions — everyone is clocked out.", reply_markup=ADMIN_KB)
         return
 
     text = f"⚠️ *{len(sessions)} open session(s):*\n\n"
@@ -286,7 +421,8 @@ async def cmd_opensessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton(f"Close {s['emp_name']} now", callback_data=f"adm_close_{s['id']}"),
             InlineKeyboardButton("✏️ Edit time",               callback_data=f"adm_edit_{s['id']}"),
         ])
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(
+        text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def handle_admin_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -305,7 +441,7 @@ async def handle_admin_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _, minutes = db.close_session(session_id, sess["start_time"])
         await query.edit_message_text(
             f"✅ Closed. Duration: *{db.fmt_dur(minutes)}*\n_(Use Edit time if incorrect)_",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
     elif action == "edit":
         ctx.user_data["editing_session_id"] = session_id
@@ -315,95 +451,36 @@ async def handle_admin_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✏️ *Edit clock-out time*\n\n"
             f"👤 {emp['name'] if emp else '?'}  →  {job['car'] if job else sess['job_id']}\n"
             f"🕐 Clocked in at {db.fmt_time(sess['start_time'])}\n\n"
-            f"Type the correct end time:\n_(e.g.  5:30 PM  or  17:30)_",
-            parse_mode="Markdown"
+            f"Type the correct end time (LA time):\n_(e.g.  5:30 PM  or  17:30)_",
+            parse_mode="Markdown",
         )
         return EDITING_SESSION_TIME
 
 
 async def receive_edited_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text in BUTTON_LABELS:
+        await update.message.reply_text(
+            "Please type the end time (e.g. 5:30 PM or 17:30), or /cancel.")
+        return EDITING_SESSION_TIME
+
     session_id = ctx.user_data.pop("editing_session_id", None)
     if not session_id:
         return ConversationHandler.END
     sess    = db.get_session(session_id)
-    end_str = db.parse_time_input(update.message.text)
+    end_str = db.parse_time_input(text)
     if not end_str or not sess:
-        await update.message.reply_text("❌ Couldn't parse time. Try again:\n_(e.g.  5:30 PM  or  17:30)_", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ Couldn't parse time. Try again:\n_(e.g.  5:30 PM  or  17:30)_",
+            parse_mode="Markdown",
+        )
         ctx.user_data["editing_session_id"] = session_id
         return EDITING_SESSION_TIME
     _, minutes = db.close_session(session_id, sess["start_time"], end_str=end_str)
     await update.message.reply_text(
         f"✅ *Updated!*\n⏱ Duration: *{db.fmt_dur(minutes)}*",
-        parse_mode="Markdown", reply_markup=ADMIN_KB
+        parse_mode="Markdown", reply_markup=ADMIN_KB,
     )
-    return ConversationHandler.END
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Add Job dialog
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def cmd_addjob(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return ConversationHandler.END
-    await update.message.reply_text(
-        "*New Repair Order*\n\nStep 1/5 — RO number:\n_(e.g. RO-1043)_",
-        parse_mode="Markdown"
-    )
-    return ADD_JOB_ID
-
-async def addjob_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    job_id = update.message.text.strip().upper()
-    if job_id in BUTTON_COMMANDS:
-        return ADD_JOB_ID
-    if db.get_job(job_id):
-        await update.message.reply_text(f"⚠️ *{job_id}* already exists. Enter another:", parse_mode="Markdown")
-        return ADD_JOB_ID
-    ctx.user_data["new_job"] = {"id": job_id}
-    await update.message.reply_text(f"✅ {job_id}\n\nStep 2/5 — Make & model:\n_(e.g. BMW X5)_", parse_mode="Markdown")
-    return ADD_JOB_CAR
-
-async def addjob_car(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["new_job"]["car"] = update.message.text.strip()
-    await update.message.reply_text("Step 3/5 — License plate:\n_(or /skip)_", parse_mode="Markdown")
-    return ADD_JOB_PLATE
-
-async def addjob_plate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    ctx.user_data["new_job"]["plate"] = "" if t == "/skip" else t.upper()
-    await update.message.reply_text("Step 4/5 — Customer name:\n_(or /skip)_", parse_mode="Markdown")
-    return ADD_JOB_CLIENT
-
-async def addjob_client(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    ctx.user_data["new_job"]["client"] = "" if t == "/skip" else t
-    await update.message.reply_text(
-        "Step 5/5 — Work description:\n_(e.g. Front bumper repaint, hood dent)_\n_(or /skip)_",
-        parse_mode="Markdown"
-    )
-    return ADD_JOB_WORKS
-
-async def addjob_works(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    j = ctx.user_data.pop("new_job", {})
-    j["works"] = "" if t == "/skip" else t
-    db.add_job(j["id"], j["car"], j.get("plate",""), j.get("client",""), j.get("works",""))
-    qr_link = f"https://t.me/{BOT_USERNAME}?start={j['id']}"
-    await update.message.reply_text(
-        f"✅ *Job created!*\n\n"
-        f"📋 *{j['id']}*\n"
-        f"🚗 {j['car']}  ·  {j.get('plate') or '—'}\n"
-        f"👤 {j.get('client') or '—'}\n"
-        f"🔧 {j.get('works') or '—'}",
-        parse_mode="Markdown", reply_markup=ADMIN_KB
-    )
-    await _send_qr(update.message, j["id"], j["car"], j.get("plate",""), qr_link)
-    return ConversationHandler.END
-
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.pop("new_job", None)
-    ctx.user_data.pop("editing_session_id", None)
-    await update.message.reply_text("❌ Cancelled.", reply_markup=ADMIN_KB)
     return ConversationHandler.END
 
 
@@ -416,7 +493,8 @@ async def cmd_jobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     jobs = db.get_all_jobs("active")
     if not jobs:
-        await update.message.reply_text("No active jobs. Tap 📋 New Job to create one.", reply_markup=ADMIN_KB)
+        await update.message.reply_text(
+            "No active jobs. Tap 📋 New Job to create one.", reply_markup=ADMIN_KB)
         return
 
     text = "🚗 *Active Jobs:*\n\n"
@@ -426,13 +504,12 @@ async def cmd_jobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         badge    = " 🟢" if active_s else ""
         text    += f"*{j['id']}*{badge}  {j['car']}  {j['plate'] or ''}\n"
         text    += f"👤 {j['client'] or '—'}  ·  ⏱ {db.fmt_dur(total)} total\n"
-
-        if active_s:
-            for s in active_s:
-                text += f"  › {s['emp_name']}: working for *{db.live_dur(s['start_time'])}*\n"
+        for s in active_s:
+            text += f"  › {s['emp_name']}: *{db.live_dur(s['start_time'])}*\n"
         text += "\n"
 
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=ADMIN_KB)
+
 
 async def cmd_closejob(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -444,8 +521,22 @@ async def cmd_closejob(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not db.get_job(job_id):
         await update.message.reply_text(f"Job *{job_id}* not found.", parse_mode="Markdown")
         return
+
+    active = db.get_active_sessions_for_job(job_id)
+    if active:
+        names = ", ".join(s["emp_name"] for s in active)
+        await update.message.reply_text(
+            f"⚠️ *Cannot close {job_id}*\n\n"
+            f"The following technician(s) are still clocked in:\n👤 {names}\n\n"
+            f"Use ⚠️ Open Sessions to close their sessions first.",
+            parse_mode="Markdown", reply_markup=ADMIN_KB,
+        )
+        return
+
     db.close_job(job_id)
-    await update.message.reply_text(f"✅ Job *{job_id}* closed.", parse_mode="Markdown", reply_markup=ADMIN_KB)
+    await update.message.reply_text(
+        f"✅ Job *{job_id}* closed.", parse_mode="Markdown", reply_markup=ADMIN_KB)
+
 
 async def cmd_qrlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -463,6 +554,70 @@ async def cmd_qrlink(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Active — who's clocked in right now
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def cmd_active(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    sessions = db.get_all_open_sessions()
+    if not sessions:
+        await update.message.reply_text(
+            "✅ No one is currently clocked in.", reply_markup=ADMIN_KB)
+        return
+
+    text = f"🟢 *Currently Clocked In — {len(sessions)} session(s):*\n\n"
+    for s in sessions:
+        text += (
+            f"👤 *{s['emp_name']}*\n"
+            f"  🚗 {s['car']}  ·  📋 {s['job_id']}\n"
+            f"  🕐 Since {db.fmt_time(s['start_time'])}  ·  ⏱ {db.live_dur(s['start_time'])}\n\n"
+        )
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=ADMIN_KB)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# My Stats — technician's own weekly hours
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def cmd_mystats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid      = update.effective_user.id
+    employee = db.get_employee(uid)
+    if not employee:
+        await update.message.reply_text(
+            "You're not registered yet. Scan a car QR code to get started.")
+        return
+
+    sessions  = db.get_employee_week_hours(uid)
+    total_min = sum(s["duration_minutes"] or 0 for s in sessions)
+    open_sess = db.get_employee_open_session_any(uid)
+
+    la_now     = db.get_la_now()
+    week_start = (la_now.date().isoformat())
+
+    text = f"📊 *Your hours this week, {employee['name']}:*\n\n"
+
+    if sessions:
+        for s in sessions:
+            text += (
+                f"🚗 {s['car']}  ·  📋 {s['job_id']}\n"
+                f"  {db.fmt_time(s['start_time'])} → {db.fmt_time(s['end_time'])}"
+                f"  *({db.fmt_dur(s['duration_minutes'])})*\n\n"
+            )
+    else:
+        text += "No completed sessions this week.\n\n"
+
+    if open_sess:
+        text += (
+            f"🟢 *Currently clocked in:*\n"
+            f"🚗 {open_sess['car']}  ·  ⏱ {db.live_dur(open_sess['start_time'])}\n\n"
+        )
+
+    text += f"⏱ *Total completed: {db.fmt_dur(total_min)}*"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Staff
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -473,7 +628,7 @@ async def cmd_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not employees:
         await update.message.reply_text(
             f"No technicians yet.\nShare the bot: t.me/{BOT_USERNAME}\n"
-            "They register on first scan.", reply_markup=ADMIN_KB
+            "They register on first scan.", reply_markup=ADMIN_KB,
         )
         return
     text = "👥 *Registered Technicians:*\n\n"
@@ -482,6 +637,7 @@ async def cmd_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text += "\n/removestaff — remove someone"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=ADMIN_KB)
 
+
 async def cmd_removestaff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -489,9 +645,14 @@ async def cmd_removestaff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not employees:
         await update.message.reply_text("No technicians to remove.", reply_markup=ADMIN_KB)
         return
-    keyboard = [[InlineKeyboardButton(emp["name"], callback_data=f"rem_{emp['telegram_id']}")] for emp in employees]
+    keyboard = [
+        [InlineKeyboardButton(emp["name"], callback_data=f"rem_{emp['telegram_id']}")]
+        for emp in employees
+    ]
     keyboard.append([InlineKeyboardButton("✖ Cancel", callback_data="rem_cancel")])
-    await update.message.reply_text("Who do you want to remove?", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(
+        "Who do you want to remove?", reply_markup=InlineKeyboardMarkup(keyboard))
+
 
 async def handle_remove_staff(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -533,8 +694,11 @@ def _build_report(days):
         text += f"  ⏱ *Total: {db.fmt_dur(d['total'])}*\n\n"
     return text.strip()
 
+
 async def _send_report(update: Update, days: int):
-    await update.message.reply_text(_build_report(days), parse_mode="Markdown", reply_markup=ADMIN_KB)
+    await update.message.reply_text(
+        _build_report(days), parse_mode="Markdown", reply_markup=ADMIN_KB)
+
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -558,54 +722,79 @@ async def evening_reminder_job(ctx):
             continue
         notified.add(tid)
         try:
-            await ctx.bot.send_message(tid,
+            await ctx.bot.send_message(
+                tid,
                 f"⏰ *Reminder — {BRAND}*\n\n"
                 f"You're still clocked in on:\n"
                 f"🚗 *{s['car']}*  ({s['job_id']})\n"
                 f"🕐 Since {db.fmt_time(s['start_time'])}  ·  {db.live_dur(s['start_time'])}\n\n"
                 f"Don't forget to scan the QR when you're done!",
-                parse_mode="Markdown")
+                parse_mode="Markdown",
+            )
         except Exception:
             pass
-    names = ", ".join(set(s["emp_name"] for s in sessions))
-    for aid in ADMIN_IDS:
-        try:
-            await ctx.bot.send_message(aid,
-                f"⚠️ *{len(sessions)} open session(s)*\n👤 {names}\n\nUse ⚠️ Open Sessions to fix.",
-                parse_mode="Markdown")
-        except Exception:
-            pass
+    names = ", ".join(sorted(set(s["emp_name"] for s in sessions)))
+    await notify_admins(
+        ctx.bot,
+        f"⚠️ *{len(sessions)} open session(s) at end of day*\n👤 {names}\n\n"
+        f"Use ⚠️ Open Sessions to fix.",
+    )
+
 
 async def auto_close_job(ctx):
-    closed = db.auto_close_all_open_sessions(AUTO_CLOSE_HOUR)
+    closed = db.auto_close_all_open_sessions()
     if not closed:
         return
     for s in closed:
         try:
-            await ctx.bot.send_message(s["telegram_id"],
+            await ctx.bot.send_message(
+                s["telegram_id"],
                 f"🔒 *Auto clock-out — {BRAND}*\n\n"
                 f"Your shift on *{s['car']}* was automatically closed.\n"
                 f"⏱ Recorded: *{db.fmt_dur(s['minutes'])}*\n\n"
                 f"_If incorrect, let the office manager know._",
-                parse_mode="Markdown")
+                parse_mode="Markdown",
+            )
         except Exception:
             pass
-    summary = "\n".join(f"· {s['emp_name']} — {s['car']} — {db.fmt_dur(s['minutes'])}" for s in closed)
-    for aid in ADMIN_IDS:
-        try:
-            await ctx.bot.send_message(aid,
-                f"🔒 *Auto clock-out — {len(closed)} session(s)*\n\n{summary}\n\nUse ⚠️ Open Sessions to correct times.",
-                parse_mode="Markdown")
-        except Exception:
-            pass
+    summary = "\n".join(
+        f"· {s['emp_name']} — {s['car']} — {db.fmt_dur(s['minutes'])}" for s in closed)
+    await notify_admins(
+        ctx.bot,
+        f"🔒 *Auto clock-out — {len(closed)} session(s)*\n\n{summary}\n\n"
+        f"Use ⚠️ Open Sessions to correct times.",
+    )
+
 
 async def daily_report_job(ctx):
-    text = f"📊 *Daily Report — {datetime.utcnow().strftime('%m/%d/%Y')}*\n\n{_build_report(1)}"
-    for aid in ADMIN_IDS:
-        try:
-            await ctx.bot.send_message(aid, text, parse_mode="Markdown")
-        except Exception:
-            pass
+    la_now = db.get_la_now()
+    date_str = la_now.strftime("%-m/%-d/%Y")
+    text = f"📊 *Daily Report — {date_str}*\n\n{_build_report(1)}"
+    await notify_admins(ctx.bot, text)
+
+
+async def weekly_report_job(ctx):
+    """Runs daily; sends the 7-day report only on Monday mornings (LA time)."""
+    la_now = db.get_la_now()
+    if la_now.weekday() != 0:   # 0 = Monday
+        return
+    week_start = (la_now.strftime("%-m/%-d"))
+    text = f"📆 *Weekly Report — week of {week_start}*\n\n{_build_report(7)}"
+    await notify_admins(ctx.bot, text)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Error handler
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    log.error("Unhandled exception", exc_info=ctx.error)
+    err_text = (
+        f"⚠️ *Bot Error*\n"
+        f"`{type(ctx.error).__name__}: {str(ctx.error)[:200]}`\n\n"
+        f"_Check Railway logs for full traceback._"
+    )
+    await notify_admins(ctx.bot, err_text)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -616,6 +805,7 @@ def run():
     db.init_db()
     app = Application.builder().token(TOKEN).build()
 
+    # ── Conversation: first-time registration via /start ──────────────────────
     start_conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={WAITING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)]},
@@ -623,53 +813,67 @@ def run():
         per_user=True, allow_reentry=True,
     )
 
+    # ── Conversation: add a new job ───────────────────────────────────────────
+    # Bug fix: "📋 New Job" button is handled ONLY here (not in handle_buttons).
+    # allow_reentry=True lets admins restart the flow by pressing the button again.
     job_conv = ConversationHandler(
         entry_points=[
             CommandHandler("addjob", cmd_addjob),
             MessageHandler(filters.Text(["📋 New Job"]), cmd_addjob),
         ],
         states={
-            ADD_JOB_ID:     [MessageHandler(filters.TEXT & ~filters.COMMAND, addjob_id)],
-            ADD_JOB_CAR:    [MessageHandler(filters.TEXT & ~filters.COMMAND, addjob_car)],
+            ADD_JOB_ID:     [MessageHandler(filters.TEXT, addjob_id)],
+            ADD_JOB_CAR:    [MessageHandler(filters.TEXT, addjob_car)],
             ADD_JOB_PLATE:  [MessageHandler(filters.TEXT, addjob_plate)],
             ADD_JOB_CLIENT: [MessageHandler(filters.TEXT, addjob_client)],
             ADD_JOB_WORKS:  [MessageHandler(filters.TEXT, addjob_works)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_user=True,
+        per_user=True, allow_reentry=True,
     )
 
+    # ── Conversation: admin edits a session's clock-out time ──────────────────
     edit_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(handle_admin_session, pattern="^adm_edit_")],
-        states={EDITING_SESSION_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_edited_time)]},
+        states={
+            EDITING_SESSION_TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_edited_time)
+            ]
+        },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_user=True,
     )
 
-    # Button keyboard handler — must be BEFORE other text handlers
-    button_filter = filters.Text(list(BUTTON_COMMANDS.keys()))
+    # Keyboard button handler — only buttons NOT handled by ConversationHandlers
+    app_button_filter = filters.Text(list(BUTTON_COMMANDS.keys()))
 
     app.add_handler(start_conv)
     app.add_handler(job_conv)
     app.add_handler(edit_conv)
-    app.add_handler(MessageHandler(button_filter, handle_buttons))
+    app.add_handler(MessageHandler(app_button_filter, handle_buttons))
 
     app.add_handler(CommandHandler("help",         cmd_help))
     app.add_handler(CommandHandler("jobs",         cmd_jobs))
     app.add_handler(CommandHandler("closejob",     cmd_closejob))
     app.add_handler(CommandHandler("qrlink",       cmd_qrlink))
+    app.add_handler(CommandHandler("active",       cmd_active))
+    app.add_handler(CommandHandler("mystats",      cmd_mystats))
     app.add_handler(CommandHandler("staff",        cmd_staff))
     app.add_handler(CommandHandler("removestaff",  cmd_removestaff))
     app.add_handler(CommandHandler("report",       cmd_report))
     app.add_handler(CommandHandler("opensessions", cmd_opensessions))
 
-    app.add_handler(CallbackQueryHandler(handle_switch,        pattern="^sw_"))
-    app.add_handler(CallbackQueryHandler(handle_admin_session,  pattern="^adm_close_"))
-    app.add_handler(CallbackQueryHandler(handle_remove_staff,   pattern="^rem_"))
+    app.add_handler(CallbackQueryHandler(handle_switch,       pattern="^sw_"))
+    app.add_handler(CallbackQueryHandler(handle_admin_session, pattern="^adm_close_"))
+    app.add_handler(CallbackQueryHandler(handle_remove_staff,  pattern="^rem_"))
 
-    app.job_queue.run_daily(evening_reminder_job, time=time(hour=REMINDER_HOUR,   minute=0))
-    app.job_queue.run_daily(auto_close_job,       time=time(hour=AUTO_CLOSE_HOUR, minute=0))
-    app.job_queue.run_daily(daily_report_job,     time=time(hour=REPORT_HOUR,     minute=0))
+    app.add_error_handler(error_handler)
+
+    jq = app.job_queue
+    jq.run_daily(evening_reminder_job, time=time(hour=REMINDER_HOUR,   minute=0))
+    jq.run_daily(auto_close_job,       time=time(hour=AUTO_CLOSE_HOUR, minute=0))
+    jq.run_daily(daily_report_job,     time=time(hour=REPORT_HOUR,     minute=0))
+    jq.run_daily(weekly_report_job,    time=time(hour=REPORT_HOUR,     minute=30))
 
     print(f"✅ {BRAND} — running")
     app.run_polling(drop_pending_updates=True)
