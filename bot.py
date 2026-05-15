@@ -43,21 +43,18 @@ BRAND = "🔧 Magic Auto Center"
 ADMIN_KB = ReplyKeyboardMarkup([
     [KeyboardButton("📋 New Job"),       KeyboardButton("🚗 Shop Status")],
     [KeyboardButton("📊 Today Report"),  KeyboardButton("📆 Report 7 Days")],
-    [KeyboardButton("👥 Staff"),         KeyboardButton("📋 Report 30 Days")],
+    [KeyboardButton("👥 Staff"),         KeyboardButton("📁 All Jobs")],
 ], resize_keyboard=True, input_field_placeholder="Choose an action...")
 
-# Maps button label → logical command name.
-# "📋 New Job" is handled exclusively by job_conv ConversationHandler (not handle_buttons).
+# "📋 New Job" handled exclusively by job_conv ConversationHandler (not handle_buttons).
 BUTTON_COMMANDS = {
-    "🚗 Shop Status":    "shop_status",
-    "📊 Today Report":   "report_1",
-    "📆 Report 7 Days":  "report_7",
-    "📋 Report 30 Days": "report_30",
-    "👥 Staff":          "staff",
+    "🚗 Shop Status":  "shop_status",
+    "📊 Today Report": "report_1",
+    "📆 Report 7 Days":"report_7",
+    "📁 All Jobs":     "alljobs",
+    "👥 Staff":        "staff",
 }
 
-# Set of ALL keyboard button labels — used to guard conversation state handlers
-# from accidentally treating a button press as conversational input.
 BUTTON_LABELS = {"📋 New Job"} | set(BUTTON_COMMANDS.keys())
 
 
@@ -290,8 +287,8 @@ async def handle_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _send_report(update, 1)
     elif cmd == "report_7":
         await _send_report(update, 7)
-    elif cmd == "report_30":
-        await _send_report(update, 30)
+    elif cmd == "alljobs":
+        await cmd_alljobs(update, ctx)
     elif cmd == "staff":
         await cmd_staff(update, ctx)
 
@@ -414,46 +411,89 @@ async def cmd_shop_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown", reply_markup=ADMIN_KB)
         return
 
-    all_open      = db.get_all_open_sessions()
-    active_job_ids = {s["job_id"] for s in all_open}
+    all_open       = db.get_all_open_sessions()
+    today_sessions = db.get_sessions_today()
+    today_closed   = [s for s in today_sessions if s.get("end_time")]
 
-    jobs_active = [j for j in jobs if j["id"] in active_job_ids]
-    jobs_idle   = [j for j in jobs if j["id"] not in active_job_ids]
+    open_job_ids      = {s["job_id"] for s in all_open}
+    completed_job_ids = {s["job_id"] for s in today_closed if s["job_id"] not in open_job_ids}
 
-    lines    = [f"🚗 *SHOP STATUS — {date_str}*\n", "━━━ ACTIVE JOBS ━━━\n"]
-    keyboard = []
-    suspicious = []          # (session_dict, elapsed_minutes)
+    in_progress     = [j for j in jobs if j["id"] in open_job_ids]
+    completed_today = [j for j in jobs if j["id"] in completed_job_ids]
+    idle            = [j for j in jobs if j["id"] not in open_job_ids and j["id"] not in completed_job_ids]
 
-    for j in jobs_active + jobs_idle:
-        is_active = j["id"] in active_job_ids
-        badge     = "🟢" if is_active else "⬜"
-        total     = db.get_job_total_minutes(j["id"])
+    lines      = [f"🚗 *SHOP STATUS — {date_str}*\n"]
+    keyboard   = []
+    suspicious = []
 
-        header = f"{badge} *{j['id']}*  ·  {j['car']}"
-        if j["plate"]:
-            header += f"  ·  {j['plate']}"
-        lines.append(header)
-        lines.append(f"👤 {j['client'] or '—'}  ·  ⏱ {db.fmt_dur(total)} total")
-
-        if is_active:
+    # ── Section 1: IN PROGRESS ────────────────────────────────────────────────
+    if in_progress:
+        lines.append("━━━ 🟢 IN PROGRESS ━━━\n")
+        for j in in_progress:
+            hdr = f"*{j['id']}*  ·  {j['car']}"
+            if j["plate"]:
+                hdr += f"  ·  {j['plate']}"
+            lines.append(hdr)
             for s in (s for s in all_open if s["job_id"] == j["id"]):
                 elapsed = db.elapsed_minutes(s["start_time"])
                 lines.append(
-                    f"  › {s['emp_name']}: {db.fmt_dur(elapsed)} "
-                    f"(since {db.fmt_time(s['start_time'])})"
+                    f"  › {s['emp_name']}: {db.fmt_dur(elapsed)}"
+                    f" (since {db.fmt_time(s['start_time'])})"
                 )
-                keyboard.append([InlineKeyboardButton(
-                    f"✏️ Fix: {s['emp_name']} on {s['job_id']}",
-                    callback_data=f"adm_edit_{s['id']}",
-                )])
                 if elapsed >= 8 * 60:
                     suspicious.append((s, elapsed))
-        else:
-            lines.append("  _(nobody working now)_")
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"✏️ Check-in: {s['emp_name']}",
+                        callback_data=f"adm_edit_start_{s['id']}",
+                    ),
+                    InlineKeyboardButton(
+                        "✏️ Check-out",
+                        callback_data=f"adm_edit_{s['id']}",
+                    ),
+                ])
+            lines.append("")
 
+    # ── Section 2: COMPLETED TODAY ────────────────────────────────────────────
+    if completed_today:
+        lines.append("━━━ ✅ COMPLETED TODAY ━━━\n")
+        for j in completed_today:
+            hdr = f"*{j['id']}*  ·  {j['car']}"
+            if j["plate"]:
+                hdr += f"  ·  {j['plate']}"
+            lines.append(hdr)
+            for s in (s for s in today_closed if s["job_id"] == j["id"]):
+                lines.append(
+                    f"  {s['emp_name']}: "
+                    f"{db.fmt_time(s['start_time'])} → {db.fmt_time(s['end_time'])}"
+                    f"  ({db.fmt_dur(s['duration_minutes'])})"
+                )
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"✏️ Start — {s['emp_name']}",
+                        callback_data=f"adm_edit_start_{s['id']}",
+                    ),
+                    InlineKeyboardButton(
+                        f"✏️ End — {s['emp_name']}",
+                        callback_data=f"adm_edit_{s['id']}",
+                    ),
+                ])
+            lines.append("")
+
+    # ── Section 3: IDLE ───────────────────────────────────────────────────────
+    if idle:
+        lines.append("━━━ ⬜ IDLE (no work today) ━━━\n")
+        for j in idle:
+            total = db.get_job_total_minutes(j["id"])
+            line  = f"  {j['id']}  ·  {j['car']}"
+            if j.get("client"):
+                line += f"  ·  {j['client']}"
+            if total:
+                line += f"  ·  ⏱ {db.fmt_dur(total)} all-time"
+            lines.append(line)
         lines.append("")
 
-    # ── Bottom summary ────────────────────────────────────────────────────────
+    # ── Suspicious sessions warning ───────────────────────────────────────────
     if suspicious:
         lines.append(f"━━━ ⚠️ {len(suspicious)} LONG SESSION(S) ━━━")
         for s, elapsed in suspicious:
@@ -463,19 +503,10 @@ async def cmd_shop_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             keyboard.append([
                 InlineKeyboardButton(
-                    f"✏️ Edit time — {s['emp_name']}",
-                    callback_data=f"adm_edit_{s['id']}",
-                ),
-                InlineKeyboardButton(
-                    f"⛔ Close now",
+                    f"⛔ Close: {s['emp_name']}",
                     callback_data=f"adm_close_{s['id']}",
                 ),
             ])
-    elif not jobs_active:
-        lines.append("━━━ 🏁 EVERYONE CLOCKED OUT ━━━")
-        lines.append("_Great work today!_")
-    else:
-        lines.append("━━━ NOBODY FORGOT TO CLOCK OUT ✅ ━━━")
 
     text         = "\n".join(lines)
     reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else ADMIN_KB
@@ -483,13 +514,23 @@ async def cmd_shop_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_admin_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query  = update.callback_query
     await query.answer()
-    parts      = query.data.split("_")
-    action     = parts[1]
-    session_id = int(parts[2])
-    sess       = db.get_session(session_id)
+    parts  = query.data.split("_")
+    action = parts[1]   # "close" or "edit"
 
+    # adm_edit_start_{id} vs adm_edit_{id}
+    editing_start = False
+    if action == "edit":
+        if len(parts) > 3 and parts[2] == "start":
+            editing_start = True
+            session_id    = int(parts[3])
+        else:
+            session_id = int(parts[2])
+    else:
+        session_id = int(parts[2])
+
+    sess = db.get_session(session_id)
     if not sess:
         await query.edit_message_text("Session not found.")
         return
@@ -497,20 +538,35 @@ async def handle_admin_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "close":
         _, minutes = db.close_session(session_id, sess["start_time"])
         await query.edit_message_text(
-            f"✅ Closed. Duration: *{db.fmt_dur(minutes)}*\n_(Use Edit time if incorrect)_",
+            f"✅ Closed. Duration: *{db.fmt_dur(minutes)}*\n_(Use ✏️ buttons to fix times)_",
             parse_mode="Markdown",
         )
     elif action == "edit":
+        emp      = db.get_employee(sess["employee_id"])
+        job      = db.get_job(sess["job_id"])
+        emp_name = emp["name"] if emp else "?"
+        car_name = job["car"] if job else sess["job_id"]
+
         ctx.user_data["editing_session_id"] = session_id
-        emp = db.get_employee(sess["employee_id"])
-        job = db.get_job(sess["job_id"])
-        await query.edit_message_text(
-            f"✏️ *Edit clock-out time*\n\n"
-            f"👤 {emp['name'] if emp else '?'}  →  {job['car'] if job else sess['job_id']}\n"
-            f"🕐 Clocked in at {db.fmt_time(sess['start_time'])}\n\n"
-            f"Type the correct end time (LA time):\n_(e.g.  5:30 PM  or  17:30)_",
-            parse_mode="Markdown",
-        )
+        ctx.user_data["editing_mode"]       = "start" if editing_start else "end"
+
+        if editing_start:
+            msg = (
+                f"✏️ *Edit check-in time*\n\n"
+                f"👤 {emp_name}  →  {car_name}\n"
+                f"🕐 Currently: *{db.fmt_time(sess['start_time'])}*\n"
+            )
+            if sess.get("end_time"):
+                msg += f"🕑 Checked out: {db.fmt_time(sess['end_time'])}\n"
+            msg += "\nType the correct *start* time (LA time):\n_(e.g.  9:30 AM  or  09:30)_"
+        else:
+            msg = (
+                f"✏️ *Edit check-out time*\n\n"
+                f"👤 {emp_name}  →  {car_name}\n"
+                f"🕐 Clocked in at: {db.fmt_time(sess['start_time'])}\n\n"
+                f"Type the correct *end* time (LA time):\n_(e.g.  5:30 PM  or  17:30)_"
+            )
+        await query.edit_message_text(msg, parse_mode="Markdown")
         return EDITING_SESSION_TIME
 
 
@@ -518,26 +574,43 @@ async def receive_edited_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text in BUTTON_LABELS:
         await update.message.reply_text(
-            "Please type the end time (e.g. 5:30 PM or 17:30), or /cancel.")
+            "Please type the time (e.g. 5:30 PM or 17:30), or /cancel.")
         return EDITING_SESSION_TIME
 
     session_id = ctx.user_data.pop("editing_session_id", None)
+    mode       = ctx.user_data.pop("editing_mode", "end")
     if not session_id:
         return ConversationHandler.END
+
     sess    = db.get_session(session_id)
-    end_str = db.parse_time_input(text)
-    if not end_str or not sess:
+    new_str = db.parse_time_input(text)
+    if not new_str or not sess:
         await update.message.reply_text(
             "❌ Couldn't parse time. Try again:\n_(e.g.  5:30 PM  or  17:30)_",
             parse_mode="Markdown",
         )
         ctx.user_data["editing_session_id"] = session_id
+        ctx.user_data["editing_mode"]       = mode
         return EDITING_SESSION_TIME
-    _, minutes = db.close_session(session_id, sess["start_time"], end_str=end_str)
-    await update.message.reply_text(
-        f"✅ *Updated!*\n⏱ Duration: *{db.fmt_dur(minutes)}*",
-        parse_mode="Markdown", reply_markup=ADMIN_KB,
-    )
+
+    if mode == "start":
+        db.update_session_start(session_id, new_str)
+        updated = db.get_session(session_id)
+        dur_str = db.fmt_dur(updated["duration_minutes"]) if updated and updated.get("duration_minutes") else "—"
+        await update.message.reply_text(
+            f"✅ *Check-in updated!*\n"
+            f"🕐 New check-in: *{db.fmt_time(new_str)}*\n"
+            f"⏱ Duration: *{dur_str}*",
+            parse_mode="Markdown", reply_markup=ADMIN_KB,
+        )
+    else:
+        _, minutes = db.close_session(session_id, sess["start_time"], end_str=new_str)
+        await update.message.reply_text(
+            f"✅ *Check-out updated!*\n"
+            f"🕑 New check-out: *{db.fmt_time(new_str)}*\n"
+            f"⏱ Duration: *{db.fmt_dur(minutes)}*",
+            parse_mode="Markdown", reply_markup=ADMIN_KB,
+        )
     return ConversationHandler.END
 
 
@@ -719,6 +792,153 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# All Jobs manager
+# ═══════════════════════════════════════════════════════════════════════════════
+
+JOBS_PER_PAGE = 5
+
+
+def _build_alljobs_page(jobs, page):
+    total  = len(jobs)
+    pages  = max(1, (total + JOBS_PER_PAGE - 1) // JOBS_PER_PAGE)
+    page   = max(0, min(page, pages - 1))
+    chunk  = jobs[page * JOBS_PER_PAGE:(page + 1) * JOBS_PER_PAGE]
+
+    lines = [f"📁 *ALL JOBS* — {total} total  (page {page + 1}/{pages})\n"]
+    keyboard = []
+
+    for j in chunk:
+        status    = "🟢" if j["status"] == "active" else "🔴"
+        total_min = db.get_job_total_minutes(j["id"])
+        sess_cnt  = db.get_job_session_count(j["id"])
+
+        line = f"{status} *{j['id']}*  ·  {j['car']}"
+        if j.get("plate"):
+            line += f"  ·  {j['plate']}"
+        if j.get("client"):
+            line += f"\n      👤 {j['client']}"
+        if total_min:
+            line += f"  ·  ⏱ {db.fmt_dur(total_min)}"
+        if sess_cnt:
+            line += f"  ({sess_cnt} sessions)"
+        lines.append(line)
+
+        row = [InlineKeyboardButton("🔗 QR", callback_data=f"aj_qr_{j['id']}")]
+        if j["status"] == "active":
+            row.append(InlineKeyboardButton("✅ Close", callback_data=f"aj_close_{j['id']}"))
+        row.append(InlineKeyboardButton("🗑 Delete", callback_data=f"aj_del_{j['id']}"))
+        keyboard.append(row)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"aj_page_{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="aj_noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"aj_page_{page + 1}"))
+    keyboard.append(nav)
+
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+async def cmd_alljobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    jobs = db.get_all_jobs_all()
+    if not jobs:
+        await update.message.reply_text("No jobs found.", reply_markup=ADMIN_KB)
+        return
+    ctx.user_data["alljobs_cache"] = jobs
+    ctx.user_data["alljobs_page"]  = 0
+    text, markup = _build_alljobs_page(jobs, 0)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+
+
+async def handle_alljobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data  = query.data
+
+    if data == "aj_noop":
+        return
+
+    if data.startswith("aj_page_"):
+        page = int(data[len("aj_page_"):])
+        jobs = ctx.user_data.get("alljobs_cache") or db.get_all_jobs_all()
+        ctx.user_data["alljobs_cache"] = jobs
+        ctx.user_data["alljobs_page"]  = page
+        text, markup = _build_alljobs_page(jobs, page)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+        return
+
+    if data.startswith("aj_qr_"):
+        job_id  = data[len("aj_qr_"):]
+        job     = db.get_job(job_id)
+        if not job:
+            await query.answer("Job not found.", show_alert=True)
+            return
+        qr_link = f"https://t.me/{BOT_USERNAME}?start={job_id}"
+        await _send_qr(query.message, job_id, job["car"], job.get("plate", ""), qr_link)
+        return
+
+    if data.startswith("aj_close_"):
+        job_id = data[len("aj_close_"):]
+        job    = db.get_job(job_id)
+        if not job:
+            await query.answer("Job not found.", show_alert=True)
+            return
+        if job["status"] != "active":
+            await query.answer("Job is already closed.", show_alert=True)
+            return
+        active = db.get_active_sessions_for_job(job_id)
+        if active:
+            names = ", ".join(s["emp_name"] for s in active)
+            await query.answer(f"⚠️ Cannot close — {names} still clocked in.", show_alert=True)
+            return
+        db.close_job(job_id)
+        jobs = db.get_all_jobs_all()
+        ctx.user_data["alljobs_cache"] = jobs
+        page = ctx.user_data.get("alljobs_page", 0)
+        text, markup = _build_alljobs_page(jobs, page)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+        return
+
+    if data.startswith("aj_del_ok_"):
+        job_id = data[len("aj_del_ok_"):]
+        db.delete_job(job_id)
+        jobs = db.get_all_jobs_all()
+        ctx.user_data["alljobs_cache"] = jobs
+        page = ctx.user_data.get("alljobs_page", 0)
+        if not jobs:
+            await query.edit_message_text(f"✅ Job *{job_id}* deleted. No more jobs.",
+                                          parse_mode="Markdown")
+            return
+        text, markup = _build_alljobs_page(jobs, page)
+        await query.edit_message_text(
+            f"✅ *{job_id}* deleted.\n\n" + text,
+            parse_mode="Markdown", reply_markup=markup)
+        return
+
+    if data.startswith("aj_del_"):
+        job_id   = data[len("aj_del_"):]
+        job      = db.get_job(job_id)
+        sess_cnt = db.get_job_session_count(job_id)
+        warn     = f" and *{sess_cnt}* session(s)" if sess_cnt else ""
+        car_str  = job["car"] if job else job_id
+        page     = ctx.user_data.get("alljobs_page", 0)
+        markup   = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚠️ Yes, delete", callback_data=f"aj_del_ok_{job_id}"),
+            InlineKeyboardButton("✖ Cancel",        callback_data=f"aj_page_{page}"),
+        ]])
+        await query.edit_message_text(
+            f"🗑 *Delete {job_id}?*\n\n"
+            f"This will permanently delete *{job_id}* ({car_str}){warn}.\n\n"
+            f"⚠️ Cannot be undone.",
+            parse_mode="Markdown", reply_markup=markup,
+        )
+        return
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Scheduled jobs
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -871,10 +1091,12 @@ def run():
     app.add_handler(CommandHandler("staff",       cmd_staff))
     app.add_handler(CommandHandler("removestaff", cmd_removestaff))
     app.add_handler(CommandHandler("report",      cmd_report))
+    app.add_handler(CommandHandler("alljobs",     cmd_alljobs))
 
-    app.add_handler(CallbackQueryHandler(handle_switch,       pattern="^sw_"))
+    app.add_handler(CallbackQueryHandler(handle_switch,        pattern="^sw_"))
     app.add_handler(CallbackQueryHandler(handle_admin_session, pattern="^adm_close_"))
     app.add_handler(CallbackQueryHandler(handle_remove_staff,  pattern="^rem_"))
+    app.add_handler(CallbackQueryHandler(handle_alljobs,       pattern="^aj_"))
 
     app.add_error_handler(error_handler)
 
