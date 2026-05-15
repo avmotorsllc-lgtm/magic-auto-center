@@ -807,7 +807,7 @@ def _build_alljobs_page(jobs, page):
     lines    = [f"📋 *ALL JOBS — {total} total*\n"]
     keyboard = []
 
-    SEP = "━━━━━━━━━━━━━━━━━━━━"
+    SEP = "──────────────────"
 
     for j in chunk:
         jid       = j["id"]
@@ -827,14 +827,15 @@ def _build_alljobs_page(jobs, page):
         if sess_cnt:
             detail += f"  ·  {sess_cnt} session{'s' if sess_cnt != 1 else ''}"
         lines.append(detail)
-        lines.append(SEP)
-
-        row = [InlineKeyboardButton(f"🔗 QR: {jid}", callback_data=f"aj_qr_{jid}")]
-        if j["status"] == "active":
-            row.append(InlineKeyboardButton(f"✅ Close {jid}", callback_data=f"aj_close_{jid}"))
-        row.append(InlineKeyboardButton(f"🗑 Delete {jid}", callback_data=f"aj_del_{jid}"))
-        keyboard.append(row)
         lines.append("")
+
+        # Row 1: QR + Close (active) or QR only (closed)
+        row1 = [InlineKeyboardButton("🔗 QR", callback_data=f"aj_qr_{jid}")]
+        if j["status"] == "active":
+            row1.append(InlineKeyboardButton("✅ Close", callback_data=f"aj_close_{jid}"))
+        keyboard.append(row1)
+        # Row 2: Delete alone
+        keyboard.append([InlineKeyboardButton("🗑 Delete", callback_data=f"aj_del_{jid}")])
 
     nav = []
     if page > 0:
@@ -933,13 +934,12 @@ async def handle_alljobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         page     = ctx.user_data.get("alljobs_page", 0)
         warn     = f" This removes *{sess_cnt}* time record(s)." if sess_cnt else ""
         markup   = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⚠️ Yes, delete", callback_data=f"aj_del_ok_{job_id}"),
-            InlineKeyboardButton("✖ Cancel",        callback_data=f"aj_page_{page}"),
+            InlineKeyboardButton("✅ Yes, delete", callback_data=f"aj_del_ok_{job_id}"),
+            InlineKeyboardButton("❌ Cancel",      callback_data=f"aj_page_{page}"),
         ]])
         await query.edit_message_text(
             f"⚠️ *Delete {job_id} ({car_str})?*\n\n"
-            f"This removes ALL time records.{warn}\n\n"
-            f"Cannot be undone.",
+            f"All time records will be lost forever.",
             parse_mode="Markdown", reply_markup=markup,
         )
         return
