@@ -248,9 +248,7 @@ async def handle_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text
     cmd  = BUTTON_COMMANDS.get(text)
-    if cmd == "addjob":
-        return await cmd_addjob(update, ctx)
-    elif cmd == "jobs":
+    if cmd == "jobs":
         await cmd_jobs(update, ctx)
     elif cmd == "report_1":
         await _send_report(update, 1)
@@ -626,7 +624,10 @@ def run():
     )
 
     job_conv = ConversationHandler(
-        entry_points=[CommandHandler("addjob", cmd_addjob)],
+        entry_points=[
+            CommandHandler("addjob", cmd_addjob),
+            MessageHandler(filters.Text(["📋 New Job"]), cmd_addjob),
+        ],
         states={
             ADD_JOB_ID:     [MessageHandler(filters.TEXT & ~filters.COMMAND, addjob_id)],
             ADD_JOB_CAR:    [MessageHandler(filters.TEXT & ~filters.COMMAND, addjob_car)],
