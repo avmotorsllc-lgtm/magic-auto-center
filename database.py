@@ -1,65 +1,83 @@
 """
 database.py — Magic Auto Center
-PostgreSQL in production (Railway), SQLite for local dev.
+PostgreSQL via pg8000 (pure Python, no system deps) in production,
+SQLite for local dev.
 """
 import os
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 
+def _pg_connect():
+    import pg8000
+    u = urlparse(DATABASE_URL)
+    return pg8000.connect(
+        host=u.hostname,
+        database=u.path.lstrip("/"),
+        user=u.username,
+        password=u.password,
+        port=u.port or 5432,
+        ssl_context=True,
+    )
+
+
 def get_db():
     if DATABASE_URL:
-        import psycopg2, psycopg2.extras
-        conn = psycopg2.connect(DATABASE_URL)
-        conn.autocommit = True
-        return conn
-    else:
-        import sqlite3
-        conn = sqlite3.connect("magic_auto.db")
-        conn.row_factory = sqlite3.Row
-        return conn
+        return _pg_connect()
+    import sqlite3
+    conn = sqlite3.connect("magic_auto.db")
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def _cur(conn):
+def _rows(cur):
+    """Convert pg8000 rows to list of dicts."""
     if DATABASE_URL:
-        import psycopg2.extras
-        return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    return conn.cursor()
+        cols = [d[0] for d in cur.description] if cur.description else []
+        return [dict(zip(cols, row)) for row in (cur.fetchall() or [])]
+    rows = cur.fetchall()
+    return [dict(r) for r in rows] if rows else []
+
+
+def _row(cur):
+    if DATABASE_URL:
+        cols = [d[0] for d in cur.description] if cur.description else []
+        r = cur.fetchone()
+        return dict(zip(cols, r)) if r else None
+    r = cur.fetchone()
+    return dict(r) if r else None
 
 
 def _ph():
     return "%s" if DATABASE_URL else "?"
 
 
-def _row(r):
-    return dict(r) if r else None
-
-
 def _fetchone(sql, *args):
     conn = get_db()
-    cur  = _cur(conn)
+    cur  = conn.cursor()
     cur.execute(sql, args if args else None)
-    row  = cur.fetchone()
+    result = _row(cur)
+    conn.commit() if DATABASE_URL else conn.commit()
     conn.close()
-    return _row(row)
+    return result
 
 
 def _fetchall(sql, *args):
     conn = get_db()
-    cur  = _cur(conn)
+    cur  = conn.cursor()
     cur.execute(sql, args if args else None)
-    rows = cur.fetchall()
+    result = _rows(cur)
     conn.close()
-    return [dict(r) for r in rows]
+    return result
 
 
 def _run(sql, *args):
     conn = get_db()
-    cur  = _cur(conn)
+    cur  = conn.cursor()
     cur.execute(sql, args if args else None)
-    if not DATABASE_URL:
-        conn.commit()
+    conn.commit()
     conn.close()
 
 
@@ -79,7 +97,7 @@ def _now():
 
 def init_db():
     conn = get_db()
-    cur  = _cur(conn)
+    cur  = conn.cursor()
     if DATABASE_URL:
         cur.execute("""CREATE TABLE IF NOT EXISTS employees (
             telegram_id BIGINT PRIMARY KEY, name TEXT NOT NULL,
@@ -112,11 +130,9 @@ def init_db():
         """)
         try:
             cur.execute("ALTER TABLE sessions ADD COLUMN auto_closed INTEGER DEFAULT 0")
-            conn.commit()
         except Exception:
             pass
-    if not DATABASE_URL:
-        conn.commit()
+    conn.commit()
     conn.close()
 
 
@@ -151,7 +167,8 @@ def add_job(job_id, car, plate="", client="", works=""):
     if DATABASE_URL:
         _run("INSERT INTO jobs (id,car,plate,client,works,status) VALUES (%s,%s,%s,%s,%s,'active') "
              "ON CONFLICT (id) DO UPDATE SET car=EXCLUDED.car,plate=EXCLUDED.plate,"
-             "client=EXCLUDED.client,works=EXCLUDED.works", job_id, car, plate, client, works)
+             "client=EXCLUDED.client,works=EXCLUDED.works",
+             job_id, car, plate, client, works)
     else:
         _run("INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,'active',datetime('now'))",
              job_id, car, plate, client, works)
