@@ -79,7 +79,7 @@ def _fetchone(sql, *args):
     conn = get_db()
     try:
         cur = conn.cursor()
-        cur.execute(sql, args if args else None)
+        cur.execute(sql, args) if args else cur.execute(sql)
         return _row(cur)
     finally:
         conn.close()
@@ -89,7 +89,7 @@ def _fetchall(sql, *args):
     conn = get_db()
     try:
         cur = conn.cursor()
-        cur.execute(sql, args if args else None)
+        cur.execute(sql, args) if args else cur.execute(sql)
         return _rows(cur)
     finally:
         conn.close()
@@ -99,7 +99,7 @@ def _run(sql, *args):
     conn = get_db()
     try:
         cur = conn.cursor()
-        cur.execute(sql, args if args else None)
+        cur.execute(sql, args) if args else cur.execute(sql)
         conn.commit()
     finally:
         conn.close()
@@ -298,9 +298,18 @@ def get_session(session_id):
 
 
 def get_job_total_minutes(job_id):
+    # Closed sessions
     row = _fetchone(
-        f"SELECT COALESCE(SUM(duration_minutes),0) AS total FROM sessions WHERE job_id={_ph()}", job_id)
-    return row["total"] if row else 0
+        f"SELECT COALESCE(SUM(duration_minutes),0) AS total FROM sessions "
+        f"WHERE job_id={_ph()} AND end_time IS NOT NULL", job_id)
+    total = int(row["total"]) if row else 0
+    # Add live time for currently open sessions
+    for s in get_active_sessions_for_job(job_id):
+        try:
+            total += int((_now() - _parse_dt(s["start_time"])).total_seconds() / 60)
+        except Exception:
+            pass
+    return total
 
 
 def has_active_sessions(job_id):
