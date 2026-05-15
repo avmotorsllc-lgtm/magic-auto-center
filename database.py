@@ -262,9 +262,21 @@ def get_report_data(days=1):
 
 # ── Formatting ────────────────────────────────────────────────────────────────
 
+from zoneinfo import ZoneInfo
+LA = ZoneInfo("America/Los_Angeles")
+
+def _to_la(dt: datetime) -> datetime:
+    """Convert a naive UTC datetime to Los Angeles time."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+    return dt.astimezone(LA)
+
 def fmt_time(val):
     try:
-        return _parse_dt(val).strftime("%I:%M %p")
+        dt = _parse_dt(val)
+        return _to_la(dt).strftime("%I:%M %p")
     except Exception:
         return "—"
 
