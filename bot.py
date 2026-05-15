@@ -795,57 +795,40 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # All Jobs manager
 # ═══════════════════════════════════════════════════════════════════════════════
 
-JOBS_PER_PAGE = 5
+def _job_card(job):
+    """Returns (text, markup) for a single self-contained job message."""
+    jid       = job["id"]
+    status    = "🟢" if job["status"] == "active" else "🔴"
+    total_min = db.get_job_total_minutes(jid)
+    sess_cnt  = db.get_job_session_count(jid)
 
+    car_line = f"🚗 {job['car']}"
+    if job.get("plate"):
+        car_line += f"  ·  {job['plate']}"
 
-def _build_alljobs_page(jobs, page):
-    total  = len(jobs)
-    pages  = max(1, (total + JOBS_PER_PAGE - 1) // JOBS_PER_PAGE)
-    page   = max(0, min(page, pages - 1))
-    chunk  = jobs[page * JOBS_PER_PAGE:(page + 1) * JOBS_PER_PAGE]
+    lines = [
+        "──────────────────",
+        f"{status} *{jid}*",
+        car_line,
+        f"👤 {job.get('client') or 'No client'}",
+    ]
+    stats = []
+    if total_min:
+        stats.append(f"⏱ {db.fmt_dur(total_min)} total")
+    if sess_cnt:
+        stats.append(f"{sess_cnt} session{'s' if sess_cnt != 1 else ''}")
+    if stats:
+        lines.append("  ·  ".join(stats))
+    lines.append("──────────────────")
 
-    lines    = [f"📋 *ALL JOBS — {total} total*\n"]
-    keyboard = []
-
-    SEP = "──────────────────"
-
-    for j in chunk:
-        jid       = j["id"]
-        status    = "🟢" if j["status"] == "active" else "🔴"
-        total_min = db.get_job_total_minutes(jid)
-        sess_cnt  = db.get_job_session_count(jid)
-
-        lines.append(SEP)
-        header = f"{status} *{jid}*  ·  {j['car']}"
-        if j.get("plate"):
-            header += f"  ·  {j['plate']}"
-        lines.append(header)
-
-        detail = f"👤 {j['client'] or 'No client'}"
-        if total_min:
-            detail += f"  ·  ⏱ {db.fmt_dur(total_min)}"
-        if sess_cnt:
-            detail += f"  ·  {sess_cnt} session{'s' if sess_cnt != 1 else ''}"
-        lines.append(detail)
-        lines.append("")
-
-        # Row 1: QR + Close (active) or QR only (closed)
-        row1 = [InlineKeyboardButton("🔗 QR", callback_data=f"aj_qr_{jid}")]
-        if j["status"] == "active":
-            row1.append(InlineKeyboardButton("✅ Close", callback_data=f"aj_close_{jid}"))
-        keyboard.append(row1)
-        # Row 2: Delete alone
-        keyboard.append([InlineKeyboardButton("🗑 Delete", callback_data=f"aj_del_{jid}")])
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"aj_page_{page - 1}"))
-    nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="aj_noop"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"aj_page_{page + 1}"))
-    keyboard.append(nav)
-
-    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+    row1 = [InlineKeyboardButton("🔗 QR Code", callback_data=f"aj_qr_{jid}")]
+    if job["status"] == "active":
+        row1.append(InlineKeyboardButton("✅ Close Job", callback_data=f"aj_close_{jid}"))
+    markup = InlineKeyboardMarkup([
+        row1,
+        [InlineKeyboardButton("🗑️ Delete Job", callback_data=f"aj_del_{jid}")],
+    ])
+    return "\n".join(lines), markup
 
 
 async def cmd_alljobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -855,10 +838,11 @@ async def cmd_alljobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not jobs:
         await update.message.reply_text("No jobs found.", reply_markup=ADMIN_KB)
         return
-    ctx.user_data["alljobs_cache"] = jobs
-    ctx.user_data["alljobs_page"]  = 0
-    text, markup = _build_alljobs_page(jobs, 0)
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+    await update.message.reply_text(
+        f"📋 *ALL JOBS — {len(jobs)} total*", parse_mode="Markdown")
+    for job in jobs:
+        text, markup = _job_card(job)
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
 
 
 async def handle_alljobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -866,21 +850,9 @@ async def handle_alljobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data  = query.data
 
-    if data == "aj_noop":
-        return
-
-    if data.startswith("aj_page_"):
-        page = int(data[len("aj_page_"):])
-        jobs = ctx.user_data.get("alljobs_cache") or db.get_all_jobs_all()
-        ctx.user_data["alljobs_cache"] = jobs
-        ctx.user_data["alljobs_page"]  = page
-        text, markup = _build_alljobs_page(jobs, page)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
-        return
-
     if data.startswith("aj_qr_"):
-        job_id  = data[len("aj_qr_"):]
-        job     = db.get_job(job_id)
+        job_id = data[len("aj_qr_"):]
+        job    = db.get_job(job_id)
         if not job:
             await query.answer("Job not found.", show_alert=True)
             return
@@ -895,51 +867,51 @@ async def handle_alljobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.answer("Job not found.", show_alert=True)
             return
         if job["status"] != "active":
-            await query.answer("Job is already closed.", show_alert=True)
+            await query.answer("Already closed.", show_alert=True)
             return
         active = db.get_active_sessions_for_job(job_id)
         if active:
             names = ", ".join(s["emp_name"] for s in active)
-            await query.answer(f"⚠️ Cannot close — {names} still clocked in.", show_alert=True)
+            await query.answer(f"⚠️ {names} still clocked in.", show_alert=True)
             return
         db.close_job(job_id)
-        jobs = db.get_all_jobs_all()
-        ctx.user_data["alljobs_cache"] = jobs
-        page = ctx.user_data.get("alljobs_page", 0)
-        text, markup = _build_alljobs_page(jobs, page)
+        updated = db.get_job(job_id)
+        text, markup = _job_card(updated)
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
         return
 
     if data.startswith("aj_del_ok_"):
         job_id = data[len("aj_del_ok_"):]
+        job    = db.get_job(job_id)
+        car    = job["car"] if job else job_id
         db.delete_job(job_id)
-        jobs = db.get_all_jobs_all()
-        ctx.user_data["alljobs_cache"] = jobs
-        page = ctx.user_data.get("alljobs_page", 0)
-        if not jobs:
-            await query.edit_message_text(f"✅ Job *{job_id}* deleted. No more jobs.",
-                                          parse_mode="Markdown")
-            return
-        text, markup = _build_alljobs_page(jobs, page)
         await query.edit_message_text(
-            f"✅ *{job_id}* deleted.\n\n" + text,
-            parse_mode="Markdown", reply_markup=markup)
+            f"🗑️ *{job_id} ({car}) deleted.*", parse_mode="Markdown")
+        return
+
+    if data.startswith("aj_del_cancel_"):
+        job_id = data[len("aj_del_cancel_"):]
+        job    = db.get_job(job_id)
+        if not job:
+            await query.edit_message_text("Job no longer exists.")
+            return
+        text, markup = _job_card(job)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
         return
 
     if data.startswith("aj_del_"):
         job_id   = data[len("aj_del_"):]
         job      = db.get_job(job_id)
-        sess_cnt = db.get_job_session_count(job_id)
         car_str  = job["car"] if job else job_id
-        page     = ctx.user_data.get("alljobs_page", 0)
-        warn     = f" This removes *{sess_cnt}* time record(s)." if sess_cnt else ""
+        sess_cnt = db.get_job_session_count(job_id)
+        warn     = f"\n⚠️ {sess_cnt} time record(s) will also be deleted." if sess_cnt else ""
         markup   = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Yes, delete", callback_data=f"aj_del_ok_{job_id}"),
-            InlineKeyboardButton("❌ Cancel",      callback_data=f"aj_page_{page}"),
+            InlineKeyboardButton("✅ Yes, delete",  callback_data=f"aj_del_ok_{job_id}"),
+            InlineKeyboardButton("❌ Cancel",        callback_data=f"aj_del_cancel_{job_id}"),
         ]])
         await query.edit_message_text(
             f"⚠️ *Delete {job_id} ({car_str})?*\n\n"
-            f"All time records will be lost forever.",
+            f"All time records will be lost forever.{warn}",
             parse_mode="Markdown", reply_markup=markup,
         )
         return
