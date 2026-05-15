@@ -5,7 +5,8 @@ Technicians scan QR codes on cars to clock in/out automatically.
 import logging
 import os
 import urllib.parse
-from datetime import time
+from collections import defaultdict
+from datetime import time, timedelta
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -56,6 +57,13 @@ BUTTON_COMMANDS = {
 }
 
 BUTTON_LABELS = {"📋 New Job"} | set(BUTTON_COMMANDS.keys())
+
+# ── Technician keyboard (non-admin) ───────────────────────────────────────────
+TECH_KB = ReplyKeyboardMarkup([
+    [KeyboardButton("⏱ My Today"), KeyboardButton("📋 My History")],
+], resize_keyboard=True, input_field_placeholder="Choose...")
+
+TECH_BUTTONS = {"⏱ My Today", "📋 My History"}
 
 
 def is_admin(uid): return uid in ADMIN_IDS
@@ -128,7 +136,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"{BRAND}\n\n👋 Hey, *{employee['name']}*!\n\n"
                 "Scan the QR sticker on a car to clock in or out. Everything is automatic ✅",
-                parse_mode="Markdown",
+                parse_mode="Markdown", reply_markup=TECH_KB,
             )
     else:
         await update.message.reply_text(f"{BRAND}\n\n👋 Welcome!\n\nWhat's your name?")
@@ -702,6 +710,122 @@ async def cmd_mystats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Technician: My Today / My History
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def cmd_tech_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid      = update.effective_user.id
+    employee = db.get_employee(uid)
+    if not employee:
+        return
+
+    la_now   = db.get_la_now()
+    date_str = la_now.strftime("%B %-d")
+
+    all_today  = db.get_sessions_today()
+    my_today   = [s for s in all_today if s["telegram_id"] == uid]
+    open_sess  = [s for s in my_today if not s.get("end_time")]
+    done_sess  = [s for s in my_today if s.get("end_time")]
+
+    header = f"👤 *{employee['name']}* — Today {date_str}\n"
+
+    if not my_today:
+        await update.message.reply_text(
+            header + "\nNo work logged yet today. Scan a QR to start! 📱",
+            parse_mode="Markdown", reply_markup=TECH_KB)
+        return
+
+    lines     = [header]
+    total_min = 0
+
+    if open_sess:
+        lines.append("🟢 *NOW WORKING:*")
+        for s in open_sess:
+            elapsed = db.elapsed_minutes(s["start_time"])
+            total_min += elapsed
+            lines.append(
+                f"🚗 {s['car']} ({s['job_id']})  ·  "
+                f"since {db.fmt_time(s['start_time'])}  ·  {db.fmt_dur(elapsed)}"
+            )
+        lines.append("")
+
+    if done_sess:
+        lines.append("✅ *DONE TODAY:*")
+        for s in done_sess:
+            total_min += s["duration_minutes"] or 0
+            lines.append(
+                f"🚗 {s['car']} ({s['job_id']})  ·  "
+                f"{db.fmt_time(s['start_time'])} → {db.fmt_time(s['end_time'])}"
+                f"  ·  {db.fmt_dur(s['duration_minutes'])}"
+            )
+        lines.append("")
+
+    lines.append(f"⏱ *Total: {db.fmt_dur(total_min)}*")
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=TECH_KB)
+
+
+async def cmd_tech_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid      = update.effective_user.id
+    employee = db.get_employee(uid)
+    if not employee:
+        return
+
+    sessions = db.get_employee_sessions_last_days(uid, days=7)
+    header   = f"👤 *{employee['name']}* — Last 7 days\n"
+
+    if not sessions:
+        await update.message.reply_text(
+            header + "\nNo sessions in the last 7 days.",
+            parse_mode="Markdown", reply_markup=TECH_KB)
+        return
+
+    by_date = defaultdict(list)
+    for s in sessions:
+        d = db.la_date(s["start_time"])
+        if d:
+            by_date[d].append(s)
+
+    la_now    = db.get_la_now()
+    lines     = [header]
+    total_all = 0
+
+    for i in range(6, -1, -1):
+        day      = (la_now - timedelta(days=i)).date()
+        day_sess = by_date.get(day, [])
+        day_min  = sum(
+            (db.elapsed_minutes(s["start_time"]) if not s.get("end_time")
+             else s["duration_minutes"] or 0)
+            for s in day_sess
+        )
+        total_all += day_min
+        date_str   = day.strftime("%b %-d")
+
+        if day_sess:
+            job_cnt = len({s["job_id"] for s in day_sess})
+            lines.append(
+                f"📅 {date_str}: *{db.fmt_dur(day_min)}*"
+                f"  ({job_cnt} job{'s' if job_cnt != 1 else ''})"
+            )
+        else:
+            lines.append(f"📅 {date_str}: —")
+
+    lines.append(f"\n⏱ *Total: {db.fmt_dur(total_all)}*")
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=TECH_KB)
+
+
+async def handle_tech_buttons(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update.effective_user.id):
+        return
+    text = update.message.text
+    if text == "⏱ My Today":
+        await cmd_tech_today(update, ctx)
+    elif text == "📋 My History":
+        await cmd_tech_history(update, ctx)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Staff
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1054,13 +1178,15 @@ def run():
         per_user=True,
     )
 
-    # Keyboard button handler — only buttons NOT handled by ConversationHandlers
-    app_button_filter = filters.Text(list(BUTTON_COMMANDS.keys()))
+    # Keyboard button handlers — separated by role
+    app_button_filter  = filters.Text(list(BUTTON_COMMANDS.keys()))
+    tech_button_filter = filters.Text(list(TECH_BUTTONS))
 
     app.add_handler(start_conv)
     app.add_handler(job_conv)
     app.add_handler(edit_conv)
-    app.add_handler(MessageHandler(app_button_filter, handle_buttons))
+    app.add_handler(MessageHandler(app_button_filter,  handle_buttons))
+    app.add_handler(MessageHandler(tech_button_filter, handle_tech_buttons))
 
     app.add_handler(CommandHandler("help",        cmd_help))
     app.add_handler(CommandHandler("status",      cmd_shop_status))   # /status shortcut
