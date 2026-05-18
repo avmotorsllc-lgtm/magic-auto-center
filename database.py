@@ -203,11 +203,18 @@ def get_employee(tid):
 
 
 def register_employee(tid, name):
+    """Create or re-activate an employee.  Always resets status so a removed
+    employee becomes visible in /removestaff again after re-registering."""
     if DATABASE_URL:
-        _run("INSERT INTO employees (telegram_id,name) VALUES (%s,%s) "
-             "ON CONFLICT (telegram_id) DO UPDATE SET name=EXCLUDED.name", tid, name)
+        _run(
+            "INSERT INTO employees (telegram_id, name) VALUES (%s, %s) "
+            "ON CONFLICT (telegram_id) DO UPDATE SET name=EXCLUDED.name, status=NULL",
+            tid, name,
+        )
     else:
-        _run("INSERT OR REPLACE INTO employees (telegram_id,name) VALUES (?,?)", tid, name)
+        # Two-step upsert: insert if missing, then update both name and status.
+        _run("INSERT OR IGNORE INTO employees (telegram_id, name) VALUES (?, ?)", tid, name)
+        _run("UPDATE employees SET name=?, status=NULL WHERE telegram_id=?", name, tid)
 
 
 def get_all_employees(include_inactive=False):
