@@ -152,6 +152,17 @@ def init_db():
                 employee_id BIGINT NOT NULL, start_time TIMESTAMP NOT NULL,
                 end_time TIMESTAMP, duration_minutes INTEGER,
                 auto_closed INTEGER DEFAULT 0)""")
+            # Non-destructive additions for existing PostgreSQL databases
+            for alter in [
+                "ALTER TABLE jobs ADD COLUMN color TEXT DEFAULT ''",
+                "ALTER TABLE jobs ADD COLUMN due_date TEXT DEFAULT ''",
+                "ALTER TABLE jobs ADD COLUMN completed_at TIMESTAMP DEFAULT NULL",
+                "ALTER TABLE employees ADD COLUMN status TEXT DEFAULT 'active'",
+            ]:
+                try:
+                    cur.execute(alter)
+                except Exception:
+                    conn.rollback()
         else:
             cur.executescript("""
                 CREATE TABLE IF NOT EXISTS employees (
@@ -168,10 +179,18 @@ def init_db():
                     start_time TEXT NOT NULL, end_time TEXT,
                     duration_minutes INTEGER, auto_closed INTEGER DEFAULT 0);
             """)
-            try:
-                cur.execute("ALTER TABLE sessions ADD COLUMN auto_closed INTEGER DEFAULT 0")
-            except Exception:
-                pass
+            # Non-destructive additions for existing SQLite databases
+            for alter in [
+                "ALTER TABLE sessions ADD COLUMN auto_closed INTEGER DEFAULT 0",
+                "ALTER TABLE jobs ADD COLUMN color TEXT DEFAULT ''",
+                "ALTER TABLE jobs ADD COLUMN due_date TEXT DEFAULT ''",
+                "ALTER TABLE jobs ADD COLUMN completed_at TEXT DEFAULT NULL",
+                "ALTER TABLE employees ADD COLUMN status TEXT DEFAULT 'active'",
+            ]:
+                try:
+                    cur.execute(alter)
+                except Exception:
+                    pass
         conn.commit()
     finally:
         conn.close()
@@ -191,11 +210,23 @@ def register_employee(tid, name):
         _run("INSERT OR REPLACE INTO employees (telegram_id,name) VALUES (?,?)", tid, name)
 
 
-def get_all_employees():
-    return _fetchall("SELECT * FROM employees ORDER BY name")
+def get_all_employees(include_inactive=False):
+    if include_inactive:
+        return _fetchall("SELECT * FROM employees ORDER BY name")
+    return _fetchall(
+        "SELECT * FROM employees "
+        "WHERE status IS NULL OR status='' OR status='active' "
+        "ORDER BY name"
+    )
+
+
+def deactivate_employee(tid):
+    """Soft-delete: mark inactive so historical sessions keep the name."""
+    _run(f"UPDATE employees SET status='inactive' WHERE telegram_id={_ph()}", tid)
 
 
 def delete_employee(tid):
+    """Hard delete — kept for internal use only."""
     _run(f"DELETE FROM employees WHERE telegram_id={_ph()}", tid)
 
 
@@ -209,19 +240,46 @@ def get_all_jobs(status="active"):
     return _fetchall(f"SELECT * FROM jobs WHERE status={_ph()} ORDER BY created_at DESC", status)
 
 
-def add_job(job_id, car, plate="", client="", works=""):
+def add_job(job_id, car, plate="", client="", works="", color="", due_date=""):
     if DATABASE_URL:
-        _run("INSERT INTO jobs (id,car,plate,client,works,status) VALUES (%s,%s,%s,%s,%s,'active') "
-             "ON CONFLICT (id) DO UPDATE SET car=EXCLUDED.car,plate=EXCLUDED.plate,"
-             "client=EXCLUDED.client,works=EXCLUDED.works",
-             job_id, car, plate, client, works)
+        _run(
+            "INSERT INTO jobs (id,car,plate,client,works,color,due_date,status) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,'active') "
+            "ON CONFLICT (id) DO UPDATE SET car=EXCLUDED.car,plate=EXCLUDED.plate,"
+            "client=EXCLUDED.client,works=EXCLUDED.works,color=EXCLUDED.color,due_date=EXCLUDED.due_date",
+            job_id, car, plate, client, works, color, due_date)
     else:
-        _run("INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,'active',datetime('now'))",
-             job_id, car, plate, client, works)
+        _run(
+            "INSERT OR REPLACE INTO jobs "
+            "(id,car,plate,client,works,color,due_date,status,created_at) "
+            "VALUES (?,?,?,?,?,?,?,'active',datetime('now'))",
+            job_id, car, plate, client, works, color, due_date)
 
 
 def close_job(job_id):
     _run(f"UPDATE jobs SET status='closed' WHERE id={_ph()}", job_id)
+
+
+def reopen_job(job_id):
+    """Reopen a closed job (undo close)."""
+    _run(f"UPDATE jobs SET status='active', completed_at=NULL WHERE id={_ph()}", job_id)
+
+
+def mark_job_done(job_id):
+    """Mark job as completed (no more clock-ins). Does not change status to closed."""
+    now = _now_naive()
+    val = now if DATABASE_URL else now.strftime("%Y-%m-%d %H:%M:%S")
+    _run(f"UPDATE jobs SET completed_at={_ph()} WHERE id={_ph()}", val, job_id)
+
+
+def auto_close_sessions_for_job(job_id):
+    """Close all open sessions for a job. Returns list of closed session dicts."""
+    sessions = get_active_sessions_for_job(job_id)
+    closed = []
+    for s in sessions:
+        _, minutes = close_session(s["id"], s["start_time"], auto=True)
+        closed.append({**s, "minutes": minutes})
+    return closed
 
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
@@ -470,17 +528,19 @@ def live_dur(start_val):
         return "—"
 
 
-def parse_time_input(text):
+def parse_time_input(text, date_la=None):
     """
     Parse a clock time string entered by the admin (e.g. '5:30 PM' or '17:30')
     as LA local time and return a UTC naive datetime string for DB storage.
+    If date_la (a date object) is given, uses that date; otherwise uses today in LA.
     """
     text = text.strip().upper().replace(".", ":")
-    today_la = get_la_now().date()
+    if date_la is None:
+        date_la = get_la_now().date()
     for fmt in ["%I:%M %p", "%H:%M", "%I%p", "%I %p"]:
         try:
             t = datetime.strptime(text, fmt)
-            la_dt  = datetime.combine(today_la, t.time(), tzinfo=LA_TZ)
+            la_dt  = datetime.combine(date_la, t.time(), tzinfo=LA_TZ)
             utc_dt = la_dt.astimezone(timezone.utc)
             return utc_dt.strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
