@@ -164,7 +164,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if args:
         job_id   = args[0].upper()
         employee = db.get_employee(uid)
-        if not employee:
+        # Inactive employees must re-register before they can clock in.
+        if not employee or employee.get("status") == "inactive":
             ctx.user_data["pending_job"] = job_id
             await update.message.reply_text(
                 f"{BRAND}\n\n👋 Welcome! You're not registered yet.\n\nWhat's your name?"
@@ -193,7 +194,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     employee = db.get_employee(uid)
-    if employee:
+    # Treat deactivated employees like new users so they can re-register.
+    is_active_employee = employee and employee.get("status") != "inactive"
+    if is_active_employee:
         if is_admin(uid):
             await _show_admin_menu(update)
         else:
@@ -426,10 +429,18 @@ async def addjob_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ADD_JOB_CAR
 
 
+def _is_cancel(text: str) -> bool:
+    return text.lower() in ("/cancel", "cancel")
+
+
 async def addjob_car(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text in BUTTON_LABELS:
         await _dispatch_button(update, ctx, text)
+        return ConversationHandler.END
+    if _is_cancel(text):
+        ctx.user_data.pop("new_job", None)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=ADMIN_KB)
         return ConversationHandler.END
     if not text or text.lower() == "/skip":
         await update.message.reply_text("❌ Car make & model cannot be empty. Please type it.")
@@ -448,6 +459,10 @@ async def addjob_plate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text in BUTTON_LABELS:
         await _dispatch_button(update, ctx, text)
         return ConversationHandler.END
+    if _is_cancel(text):
+        ctx.user_data.pop("new_job", None)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=ADMIN_KB)
+        return ConversationHandler.END
     if len(text) > 20:
         await update.message.reply_text("❌ Too long. Max 20 characters.")
         return ADD_JOB_PLATE
@@ -461,6 +476,10 @@ async def addjob_client(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text in BUTTON_LABELS:
         await _dispatch_button(update, ctx, text)
+        return ConversationHandler.END
+    if _is_cancel(text):
+        ctx.user_data.pop("new_job", None)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=ADMIN_KB)
         return ConversationHandler.END
     if len(text) > 100:
         await update.message.reply_text("❌ Too long. Max 100 characters.")
@@ -477,6 +496,10 @@ async def addjob_works(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text in BUTTON_LABELS:
         await _dispatch_button(update, ctx, text)
         return ConversationHandler.END
+    if _is_cancel(text):
+        ctx.user_data.pop("new_job", None)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=ADMIN_KB)
+        return ConversationHandler.END
     if len(text) > 300:
         await update.message.reply_text("❌ Too long. Max 300 characters.")
         return ADD_JOB_WORKS
@@ -490,6 +513,10 @@ async def addjob_color(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text in BUTTON_LABELS:
         await _dispatch_button(update, ctx, text)
+        return ConversationHandler.END
+    if _is_cancel(text):
+        ctx.user_data.pop("new_job", None)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=ADMIN_KB)
         return ConversationHandler.END
     if len(text) > 30:
         await update.message.reply_text("❌ Too long. Max 30 characters.")
@@ -505,6 +532,10 @@ async def addjob_due(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text in BUTTON_LABELS:
         await _dispatch_button(update, ctx, text)
+        return ConversationHandler.END
+    if _is_cancel(text):
+        ctx.user_data.pop("new_job", None)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=ADMIN_KB)
         return ConversationHandler.END
     if len(text) > 50:
         await update.message.reply_text("❌ Too long. Max 50 characters.")
@@ -531,6 +562,36 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("editing_session_id", None)
     ctx.user_data.pop("editing_date", None)
     await update.message.reply_text("❌ Cancelled.", reply_markup=ADMIN_KB)
+    return ConversationHandler.END
+
+
+async def conv_cmd_escape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Fallback: admin sent a slash command while inside the New Job conversation.
+    Cancel the conversation, then dispatch the command so it actually runs.
+    """
+    ctx.user_data.pop("new_job", None)
+    # Map of command → handler function
+    _cmd_map = {
+        "closejob":    cmd_closejob,
+        "qrlink":      cmd_qrlink,
+        "status":      cmd_shop_status,
+        "report":      cmd_report,
+        "staff":       cmd_staff,
+        "removestaff": cmd_removestaff,
+        "alljobs":     cmd_alljobs,
+        "help":        cmd_help,
+        "mystats":     cmd_mystats,
+    }
+    raw   = update.message.text or ""
+    parts = raw.lstrip("/").split(None, 1)
+    cmd   = parts[0].lower() if parts else ""
+    ctx.args = parts[1].split() if len(parts) > 1 else []
+    fn = _cmd_map.get(cmd)
+    if fn:
+        await fn(update, ctx)
+    else:
+        await update.message.reply_text("❌ Cancelled.", reply_markup=ADMIN_KB)
     return ConversationHandler.END
 
 
@@ -1407,21 +1468,27 @@ def run():
     )
 
     # ── Conversation: add a new job ───────────────────────────────────────────
+    _no_cmd = filters.TEXT & ~filters.COMMAND
     job_conv = ConversationHandler(
         entry_points=[
             CommandHandler("addjob", cmd_addjob),
             MessageHandler(filters.Text(["📋 New Job"]), cmd_addjob),
         ],
         states={
-            ADD_JOB_ID:     [MessageHandler(filters.TEXT, addjob_id)],
-            ADD_JOB_CAR:    [MessageHandler(filters.TEXT, addjob_car)],
-            ADD_JOB_PLATE:  [MessageHandler(filters.TEXT, addjob_plate)],
-            ADD_JOB_CLIENT: [MessageHandler(filters.TEXT, addjob_client)],
-            ADD_JOB_WORKS:  [MessageHandler(filters.TEXT, addjob_works)],
-            ADD_JOB_COLOR:  [MessageHandler(filters.TEXT, addjob_color)],
-            ADD_JOB_DUE:    [MessageHandler(filters.TEXT, addjob_due)],
+            # Each state accepts both plain text (not a command) AND the /skip command.
+            # /cancel and other slash commands fall through to the fallbacks below.
+            ADD_JOB_ID:     [MessageHandler(_no_cmd, addjob_id),     CommandHandler("skip", addjob_id)],
+            ADD_JOB_CAR:    [MessageHandler(_no_cmd, addjob_car),    CommandHandler("skip", addjob_car)],
+            ADD_JOB_PLATE:  [MessageHandler(_no_cmd, addjob_plate),  CommandHandler("skip", addjob_plate)],
+            ADD_JOB_CLIENT: [MessageHandler(_no_cmd, addjob_client), CommandHandler("skip", addjob_client)],
+            ADD_JOB_WORKS:  [MessageHandler(_no_cmd, addjob_works),  CommandHandler("skip", addjob_works)],
+            ADD_JOB_COLOR:  [MessageHandler(_no_cmd, addjob_color),  CommandHandler("skip", addjob_color)],
+            ADD_JOB_DUE:    [MessageHandler(_no_cmd, addjob_due),    CommandHandler("skip", addjob_due)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.COMMAND, conv_cmd_escape),  # any other cmd escapes conv
+        ],
         per_user=True, allow_reentry=True,
     )
 
