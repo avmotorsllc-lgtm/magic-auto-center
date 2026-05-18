@@ -164,8 +164,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if args:
         job_id   = args[0].upper()
         employee = db.get_employee(uid)
-        # Inactive employees must re-register before they can clock in.
-        if not employee or employee.get("status") == "inactive":
+        # Inactive (or absent) non-admin users must re-register before they can clock in.
+        if not is_admin(uid) and (not employee or employee.get("status") == "inactive"):
             ctx.user_data["pending_job"] = job_id
             await update.message.reply_text(
                 f"{BRAND}\n\n👋 Welcome! You're not registered yet.\n\nWhat's your name?"
@@ -193,18 +193,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _process_scan(update, ctx, employee, job)
         return ConversationHandler.END
 
+    # Admins always get the admin menu, regardless of employee table status.
+    if is_admin(uid):
+        await _show_admin_menu(update)
+        return ConversationHandler.END
+
     employee = db.get_employee(uid)
-    # Treat deactivated employees like new users so they can re-register.
-    is_active_employee = employee and employee.get("status") != "inactive"
-    if is_active_employee:
-        if is_admin(uid):
-            await _show_admin_menu(update)
-        else:
-            await update.message.reply_text(
-                f"{BRAND}\n\n👋 Hey, *{escape_md(employee['name'])}*!\n\n"
-                "Scan the QR sticker on a car to clock in or out. Everything is automatic ✅",
-                parse_mode="Markdown", reply_markup=TECH_KB,
-            )
+    # Treat deactivated (or absent) employees like new users so they can re-register.
+    if employee and employee.get("status") != "inactive":
+        await update.message.reply_text(
+            f"{BRAND}\n\n👋 Hey, *{escape_md(employee['name'])}*!\n\n"
+            "Scan the QR sticker on a car to clock in or out. Everything is automatic ✅",
+            parse_mode="Markdown", reply_markup=TECH_KB,
+        )
     else:
         await update.message.reply_text(f"{BRAND}\n\n👋 Welcome!\n\nWhat's your name?")
         return WAITING_NAME
