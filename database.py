@@ -19,6 +19,14 @@ log = logging.getLogger(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 LA_TZ = ZoneInfo("America/Los_Angeles")
 
+# Button labels to reject as employee names (with and without emoji)
+BUTTON_NAME_BLACKLIST = {
+    "📋 New Job", "🚗 Shop Status", "📊 Today Report", "📆 Report 7 Days",
+    "👥 Staff", "📁 All Jobs", "⏱ My Today", "📋 My History",
+    "New Job", "Shop Status", "Today Report", "Report 7 Days",
+    "Staff", "All Jobs", "My Today", "My History",
+}
+
 
 # ── Connection ─────────────────────────────────────────────────────────────────
 
@@ -35,7 +43,6 @@ def _pg_connect():
             port=u.port or 5432, ssl_context=ssl_ctx,
         )
     except Exception:
-        # Railway internal networking may not require SSL
         return pg8000.connect(
             host=u.hostname, database=u.path.lstrip("/"),
             user=u.username, password=u.password,
@@ -81,6 +88,9 @@ def _fetchone(sql, *args):
         cur = conn.cursor()
         cur.execute(sql, args) if args else cur.execute(sql)
         return _row(cur)
+    except Exception as e:
+        log.error("DB fetchone error: %s | sql: %s", e, sql[:80])
+        return None
     finally:
         conn.close()
 
@@ -91,6 +101,9 @@ def _fetchall(sql, *args):
         cur = conn.cursor()
         cur.execute(sql, args) if args else cur.execute(sql)
         return _rows(cur)
+    except Exception as e:
+        log.error("DB fetchall error: %s | sql: %s", e, sql[:80])
+        return []
     finally:
         conn.close()
 
@@ -101,6 +114,13 @@ def _run(sql, *args):
         cur = conn.cursor()
         cur.execute(sql, args) if args else cur.execute(sql)
         conn.commit()
+    except Exception as e:
+        log.error("DB run error: %s | sql: %s", e, sql[:80])
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         conn.close()
 
@@ -152,15 +172,16 @@ def init_db():
                 employee_id BIGINT NOT NULL, start_time TIMESTAMP NOT NULL,
                 end_time TIMESTAMP, duration_minutes INTEGER,
                 auto_closed INTEGER DEFAULT 0)""")
-            # Non-destructive additions for existing PostgreSQL databases
             for alter in [
                 "ALTER TABLE jobs ADD COLUMN color TEXT DEFAULT ''",
                 "ALTER TABLE jobs ADD COLUMN due_date TEXT DEFAULT ''",
                 "ALTER TABLE jobs ADD COLUMN completed_at TIMESTAMP DEFAULT NULL",
                 "ALTER TABLE employees ADD COLUMN status TEXT DEFAULT 'active'",
+                "ALTER TABLE jobs ADD COLUMN year TEXT DEFAULT ''",
             ]:
                 try:
                     cur.execute(alter)
+                    conn.commit()
                 except Exception:
                     conn.rollback()
         else:
@@ -179,13 +200,13 @@ def init_db():
                     start_time TEXT NOT NULL, end_time TEXT,
                     duration_minutes INTEGER, auto_closed INTEGER DEFAULT 0);
             """)
-            # Non-destructive additions for existing SQLite databases
             for alter in [
                 "ALTER TABLE sessions ADD COLUMN auto_closed INTEGER DEFAULT 0",
                 "ALTER TABLE jobs ADD COLUMN color TEXT DEFAULT ''",
                 "ALTER TABLE jobs ADD COLUMN due_date TEXT DEFAULT ''",
                 "ALTER TABLE jobs ADD COLUMN completed_at TEXT DEFAULT NULL",
                 "ALTER TABLE employees ADD COLUMN status TEXT DEFAULT 'active'",
+                "ALTER TABLE jobs ADD COLUMN year TEXT DEFAULT ''",
             ]:
                 try:
                     cur.execute(alter)
@@ -195,16 +216,35 @@ def init_db():
     finally:
         conn.close()
 
+    # ── One-time startup cleanup ───────────────────────────────────────────────
+    # Remove employees whose names are keyboard button labels
+    for bad_name in BUTTON_NAME_BLACKLIST:
+        try:
+            _run(f"DELETE FROM employees WHERE name={_ph()}", bad_name)
+        except Exception:
+            pass
+
+    # Delete 0-minute completed sessions (from double-scans)
+    try:
+        _run(
+            "DELETE FROM sessions WHERE end_time IS NOT NULL "
+            "AND (duration_minutes = 0 OR duration_minutes IS NULL)"
+        )
+    except Exception as e:
+        log.warning("Could not clean 0-min sessions: %s", e)
+
 
 # ── Employees ─────────────────────────────────────────────────────────────────
 
 def get_employee(tid):
-    return _fetchone(f"SELECT * FROM employees WHERE telegram_id={_ph()}", tid)
+    try:
+        return _fetchone(f"SELECT * FROM employees WHERE telegram_id={_ph()}", tid)
+    except Exception:
+        return None
 
 
 def register_employee(tid, name):
-    """Create or re-activate an employee.  Always resets status so a removed
-    employee becomes visible in /removestaff again after re-registering."""
+    """Create or re-activate an employee. Always resets status."""
     if DATABASE_URL:
         _run(
             "INSERT INTO employees (telegram_id, name) VALUES (%s, %s) "
@@ -212,19 +252,21 @@ def register_employee(tid, name):
             tid, name,
         )
     else:
-        # Two-step upsert: insert if missing, then update both name and status.
         _run("INSERT OR IGNORE INTO employees (telegram_id, name) VALUES (?, ?)", tid, name)
         _run("UPDATE employees SET name=?, status=NULL WHERE telegram_id=?", name, tid)
 
 
 def get_all_employees(include_inactive=False):
+    """Return active employees, excluding button-label names."""
     if include_inactive:
-        return _fetchall("SELECT * FROM employees ORDER BY name")
-    return _fetchall(
-        "SELECT * FROM employees "
-        "WHERE status IS NULL OR status='' OR status='active' "
-        "ORDER BY name"
-    )
+        rows = _fetchall("SELECT * FROM employees ORDER BY name")
+    else:
+        rows = _fetchall(
+            "SELECT * FROM employees "
+            "WHERE status IS NULL OR status='' OR status='active' "
+            "ORDER BY name"
+        )
+    return [r for r in rows if r.get("name") not in BUTTON_NAME_BLACKLIST]
 
 
 def deactivate_employee(tid):
@@ -237,43 +279,77 @@ def delete_employee(tid):
     _run(f"DELETE FROM employees WHERE telegram_id={_ph()}", tid)
 
 
+def rename_employee(tid, new_name):
+    """Rename a technician. All historical sessions reference the new name via JOIN."""
+    _run(f"UPDATE employees SET name={_ph()} WHERE telegram_id={_ph()}", new_name, tid)
+
+
+def get_similar_employee(name):
+    """Return an existing active employee whose name is similar (substring match)."""
+    employees = get_all_employees()
+    name_lower = name.lower().strip()
+    for emp in employees:
+        emp_lower = (emp.get("name") or "").lower()
+        if emp_lower and (name_lower in emp_lower or emp_lower in name_lower):
+            return emp
+    return None
+
+
 # ── Jobs ──────────────────────────────────────────────────────────────────────
 
 def get_job(job_id):
-    return _fetchone(f"SELECT * FROM jobs WHERE id={_ph()}", job_id)
+    try:
+        return _fetchone(f"SELECT * FROM jobs WHERE id={_ph()}", job_id)
+    except Exception:
+        return None
 
 
 def get_all_jobs(status="active"):
     return _fetchall(f"SELECT * FROM jobs WHERE status={_ph()} ORDER BY created_at DESC", status)
 
 
-def add_job(job_id, car, plate="", client="", works="", color="", due_date=""):
+def add_job(job_id, car, plate="", client="", works="", color="", due_date="", year=""):
     if DATABASE_URL:
         _run(
-            "INSERT INTO jobs (id,car,plate,client,works,color,due_date,status) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,'active') "
+            "INSERT INTO jobs (id,car,plate,client,works,color,due_date,year,status) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'active') "
             "ON CONFLICT (id) DO UPDATE SET car=EXCLUDED.car,plate=EXCLUDED.plate,"
-            "client=EXCLUDED.client,works=EXCLUDED.works,color=EXCLUDED.color,due_date=EXCLUDED.due_date",
-            job_id, car, plate, client, works, color, due_date)
+            "client=EXCLUDED.client,works=EXCLUDED.works,color=EXCLUDED.color,"
+            "due_date=EXCLUDED.due_date,year=EXCLUDED.year",
+            job_id, car, plate, client, works, color, due_date, year)
     else:
         _run(
             "INSERT OR REPLACE INTO jobs "
-            "(id,car,plate,client,works,color,due_date,status,created_at) "
-            "VALUES (?,?,?,?,?,?,?,'active',datetime('now'))",
-            job_id, car, plate, client, works, color, due_date)
+            "(id,car,plate,client,works,color,due_date,year,status,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,'active',datetime('now'))",
+            job_id, car, plate, client, works, color, due_date, year)
+
+
+def update_job_field(job_id, field, value):
+    """Update a single field of a job. Only safe fields are allowed."""
+    allowed = {"car", "plate", "client", "works", "color", "year"}
+    if field not in allowed:
+        raise ValueError(f"Field '{field}' not allowed for update")
+    _run(f"UPDATE jobs SET {field}={_ph()} WHERE id={_ph()}", value, job_id)
 
 
 def close_job(job_id):
-    _run(f"UPDATE jobs SET status='closed' WHERE id={_ph()}", job_id)
+    """Mark job closed and record completed_at timestamp automatically."""
+    now = _now_naive()
+    val = now if DATABASE_URL else now.strftime("%Y-%m-%d %H:%M:%S")
+    _run(
+        f"UPDATE jobs SET status='closed', completed_at={_ph()} WHERE id={_ph()}",
+        val, job_id,
+    )
 
 
 def reopen_job(job_id):
-    """Reopen a closed job (undo close)."""
+    """Reopen a closed job."""
     _run(f"UPDATE jobs SET status='active', completed_at=NULL WHERE id={_ph()}", job_id)
 
 
 def mark_job_done(job_id):
-    """Mark job as completed (no more clock-ins). Does not change status to closed."""
+    """Mark job as completed. Does not change status to closed."""
     now = _now_naive()
     val = now if DATABASE_URL else now.strftime("%Y-%m-%d %H:%M:%S")
     _run(f"UPDATE jobs SET completed_at={_ph()} WHERE id={_ph()}", val, job_id)
@@ -284,9 +360,33 @@ def auto_close_sessions_for_job(job_id):
     sessions = get_active_sessions_for_job(job_id)
     closed = []
     for s in sessions:
-        _, minutes = close_session(s["id"], s["start_time"], auto=True)
-        closed.append({**s, "minutes": minutes})
+        result = close_session(s["id"], s["start_time"], auto=True)
+        if result:
+            _, minutes = result
+            closed.append({**s, "minutes": minutes})
     return closed
+
+
+def get_job_first_session(job_id):
+    """Return the start_time of the earliest session for this job, or None."""
+    row = _fetchone(
+        f"SELECT MIN(start_time) AS first_start FROM sessions WHERE job_id={_ph()}",
+        job_id,
+    )
+    return row.get("first_start") if row else None
+
+
+def get_jobs_by_plate(plate, exclude_job_id=None):
+    """Find other jobs with the same plate number."""
+    if not plate:
+        return []
+    if exclude_job_id:
+        return _fetchall(
+            f"SELECT * FROM jobs WHERE plate={_ph()} AND id!={_ph()} ORDER BY created_at DESC",
+            plate, exclude_job_id,
+        )
+    return _fetchall(
+        f"SELECT * FROM jobs WHERE plate={_ph()} ORDER BY created_at DESC", plate)
 
 
 # ── Sessions ──────────────────────────────────────────────────────────────────
@@ -300,17 +400,26 @@ def get_open_session(job_id, emp_id):
 def get_employee_open_session_any(emp_id, exclude_job_id=None):
     if exclude_job_id:
         return _fetchone(
-            f"SELECT s.*,j.car,j.plate FROM sessions s JOIN jobs j ON j.id=s.job_id "
+            f"SELECT s.*,j.car,j.plate,j.year FROM sessions s JOIN jobs j ON j.id=s.job_id "
             f"WHERE s.employee_id={_ph()} AND s.end_time IS NULL AND s.job_id!={_ph()}",
             emp_id, exclude_job_id)
     return _fetchone(
-        f"SELECT s.*,j.car,j.plate FROM sessions s JOIN jobs j ON j.id=s.job_id "
+        f"SELECT s.*,j.car,j.plate,j.year FROM sessions s JOIN jobs j ON j.id=s.job_id "
         f"WHERE s.employee_id={_ph()} AND s.end_time IS NULL", emp_id)
+
+
+def get_employee_all_open_sessions(emp_id):
+    """All currently open sessions for an employee."""
+    return _fetchall(
+        f"""SELECT s.*,j.car,j.plate,j.year FROM sessions s JOIN jobs j ON j.id=s.job_id
+            WHERE s.employee_id={_ph()} AND s.end_time IS NULL
+            ORDER BY s.start_time""",
+        emp_id)
 
 
 def get_all_open_sessions():
     return _fetchall("""
-        SELECT s.*,e.name AS emp_name,e.telegram_id,j.car,j.plate,j.id AS job_id
+        SELECT s.*,e.name AS emp_name,e.telegram_id,j.car,j.plate,j.id AS job_id,j.year
         FROM sessions s
         JOIN employees e ON e.telegram_id=s.employee_id
         JOIN jobs j ON j.id=s.job_id
@@ -325,36 +434,79 @@ def get_active_sessions_for_job(job_id):
 
 
 def open_session(job_id, emp_id):
+    """Open a new session. Returns (session_id, start_time_str)."""
     now = _now_naive()
-    _run(f"INSERT INTO sessions (job_id,employee_id,start_time) VALUES ({_ph()},{_ph()},{_ph()})",
-         job_id, emp_id, now if DATABASE_URL else now.strftime("%Y-%m-%d %H:%M:%S"))
-    return now.strftime("%Y-%m-%d %H:%M:%S")
+    start_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    if DATABASE_URL:
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO sessions (job_id,employee_id,start_time) VALUES (%s,%s,%s) RETURNING id",
+                (job_id, emp_id, now))
+            conn.commit()
+            row = _row(cur)
+            session_id = row["id"] if row else None
+        finally:
+            conn.close()
+    else:
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO sessions (job_id,employee_id,start_time) VALUES (?,?,?)",
+                (job_id, emp_id, start_str))
+            conn.commit()
+            session_id = cur.lastrowid
+        finally:
+            conn.close()
+    return session_id, start_str
 
 
 def close_session(session_id, start_val, end_str=None, auto=False):
+    """Close a session. If duration < 1 min, DELETE it (no junk sessions).
+    Returns (end_str, minutes) or None if the session was deleted."""
     if end_str:
-        # end_str is a UTC naive string produced by parse_time_input or stored timestamps
         end_dt = datetime.strptime(end_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     else:
         end_dt = _now()
     start_dt = _parse_dt(start_val)
     minutes  = max(0, int((end_dt - start_dt).total_seconds() / 60))
+
+    if minutes < 1:
+        try:
+            _run(f"DELETE FROM sessions WHERE id={_ph()}", session_id)
+        except Exception as e:
+            log.error("Error deleting short session %s: %s", session_id, e)
+        return None  # signal: session was deleted (< 1 min)
+
     end_naive = end_dt.replace(tzinfo=None)
     end_out   = end_naive.strftime("%Y-%m-%d %H:%M:%S")
-    _run(
-        f"UPDATE sessions SET end_time={_ph()},duration_minutes={_ph()},auto_closed={_ph()} WHERE id={_ph()}",
-        end_naive if DATABASE_URL else end_out,
-        minutes, 1 if auto else 0, session_id,
-    )
+    try:
+        _run(
+            f"UPDATE sessions SET end_time={_ph()},duration_minutes={_ph()},auto_closed={_ph()} WHERE id={_ph()}",
+            end_naive if DATABASE_URL else end_out,
+            minutes, 1 if auto else 0, session_id,
+        )
+    except Exception as e:
+        log.error("Error closing session %s: %s", session_id, e)
+        return None
     return end_out, minutes
+
+
+def delete_session(session_id):
+    """Hard-delete a session (for undo clock-in)."""
+    _run(f"DELETE FROM sessions WHERE id={_ph()}", session_id)
 
 
 def auto_close_all_open_sessions():
     sessions = get_all_open_sessions()
     closed = []
     for s in sessions:
-        _, minutes = close_session(s["id"], s["start_time"], auto=True)
-        closed.append({**s, "minutes": minutes})
+        result = close_session(s["id"], s["start_time"], auto=True)
+        if result:
+            _, minutes = result
+            closed.append({**s, "minutes": minutes})
     return closed
 
 
@@ -363,12 +515,10 @@ def get_session(session_id):
 
 
 def get_job_total_minutes(job_id):
-    # Closed sessions
     row = _fetchone(
         f"SELECT COALESCE(SUM(duration_minutes),0) AS total FROM sessions "
-        f"WHERE job_id={_ph()} AND end_time IS NOT NULL", job_id)
+        f"WHERE job_id={_ph()} AND end_time IS NOT NULL AND duration_minutes > 0", job_id)
     total = int(row["total"]) if row else 0
-    # Add live time for currently open sessions
     for s in get_active_sessions_for_job(job_id):
         try:
             total += int((_now() - _parse_dt(s["start_time"])).total_seconds() / 60)
@@ -384,41 +534,94 @@ def has_active_sessions(job_id):
 
 
 def get_report_data(days=1):
-    """Return session data grouped by job. 'days=1' means today in LA timezone."""
-    la_now   = get_la_now()
-    since_la = (la_now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    """Session data grouped by job → by employee. Skips 0-min sessions."""
+    la_now    = get_la_now()
+    since_la  = (la_now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
     since_utc = since_la.astimezone(timezone.utc)
-    since = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
+    since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
 
     rows = _fetchall(
-        f"""SELECT s.*,e.name AS emp_name,j.car,j.plate,j.id AS job_id
-            FROM sessions s JOIN employees e ON e.telegram_id=s.employee_id
+        f"""SELECT s.*,e.name AS emp_name,j.car,j.plate,j.id AS job_id,j.year
+            FROM sessions s
+            JOIN employees e ON e.telegram_id=s.employee_id
             JOIN jobs j ON j.id=s.job_id
-            WHERE s.start_time>={_ph()} AND s.end_time IS NOT NULL
-            ORDER BY j.id,s.start_time""",
+            WHERE s.start_time>={_ph()} AND s.end_time IS NOT NULL AND s.duration_minutes > 0
+            ORDER BY j.id,e.name,s.start_time""",
         since)
 
     by_job = {}
     for r in rows:
         jid = r["job_id"]
-        by_job.setdefault(jid, {"car": r["car"], "plate": r["plate"], "rows": [], "total": 0})
-        by_job[jid]["rows"].append(r)
+        year = (r.get("year") or "").strip()
+        car_display = f"{year} {r['car']}".strip() if year else r["car"]
+        by_job.setdefault(jid, {"car": car_display, "plate": r["plate"], "by_emp": {}, "total": 0})
+        emp = r["emp_name"]
+        by_job[jid]["by_emp"].setdefault(emp, {"rows": [], "total": 0})
+        by_job[jid]["by_emp"][emp]["rows"].append(r)
+        by_job[jid]["by_emp"][emp]["total"] += r["duration_minutes"] or 0
         by_job[jid]["total"] += r["duration_minutes"] or 0
     return by_job
 
 
+def get_report_data_by_day(days=7):
+    """Session data grouped by day (LA) → by job → by employee. For multi-day reports."""
+    la_now    = get_la_now()
+    since_la  = (la_now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    since_utc = since_la.astimezone(timezone.utc)
+    since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+    rows = _fetchall(
+        f"""SELECT s.*,e.name AS emp_name,j.car,j.plate,j.id AS job_id,j.year
+            FROM sessions s
+            JOIN employees e ON e.telegram_id=s.employee_id
+            JOIN jobs j ON j.id=s.job_id
+            WHERE s.start_time>={_ph()} AND s.end_time IS NOT NULL AND s.duration_minutes > 0
+            ORDER BY s.start_time""",
+        since)
+
+    by_day = {}
+    for r in rows:
+        d = la_date(r["start_time"])
+        if not d:
+            continue
+        year = (r.get("year") or "").strip()
+        car_display = f"{year} {r['car']}".strip() if year else r["car"]
+        jid = r["job_id"]
+        emp = r["emp_name"]
+        if d not in by_day:
+            by_day[d] = {"jobs": {}, "total": 0}
+        if jid not in by_day[d]["jobs"]:
+            by_day[d]["jobs"][jid] = {"car": car_display, "plate": r["plate"], "by_emp": {}, "total": 0}
+        by_day[d]["jobs"][jid]["by_emp"].setdefault(emp, {"sessions": [], "total": 0})
+        by_day[d]["jobs"][jid]["by_emp"][emp]["sessions"].append(r)
+        by_day[d]["jobs"][jid]["by_emp"][emp]["total"] += r["duration_minutes"] or 0
+        by_day[d]["jobs"][jid]["total"] += r["duration_minutes"] or 0
+        by_day[d]["total"] += r["duration_minutes"] or 0
+    return by_day
+
+
+def get_sessions_for_job(job_id):
+    """All sessions for a job with employee name, sorted chronologically."""
+    return _fetchall(
+        f"""SELECT s.*,e.name AS emp_name
+            FROM sessions s JOIN employees e ON e.telegram_id=s.employee_id
+            WHERE s.job_id={_ph()}
+            ORDER BY s.start_time""",
+        job_id)
+
+
 def get_employee_week_hours(emp_id):
     """Completed sessions for this employee since Monday 00:00 LA time."""
-    la_now = get_la_now()
+    la_now    = get_la_now()
     monday_la = (la_now - timedelta(days=la_now.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0)
     since_utc = monday_la.astimezone(timezone.utc)
-    since = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
-
+    since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
     return _fetchall(
-        f"""SELECT s.start_time, s.end_time, s.duration_minutes, s.job_id, j.car
+        f"""SELECT s.start_time, s.end_time, s.duration_minutes, s.job_id, j.car, j.year
             FROM sessions s JOIN jobs j ON j.id=s.job_id
-            WHERE s.employee_id={_ph()} AND s.start_time>={_ph()} AND s.end_time IS NOT NULL
+            WHERE s.employee_id={_ph()} AND s.start_time>={_ph()}
+              AND s.end_time IS NOT NULL AND s.duration_minutes > 0
             ORDER BY s.start_time""",
         emp_id, since)
 
@@ -430,7 +633,7 @@ def get_sessions_today():
     since_utc = since_la.astimezone(timezone.utc)
     since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
     return _fetchall(
-        f"""SELECT s.*,e.name AS emp_name,e.telegram_id,j.car,j.plate,j.id AS job_id,j.client
+        f"""SELECT s.*,e.name AS emp_name,e.telegram_id,j.car,j.plate,j.id AS job_id,j.client,j.year
             FROM sessions s
             JOIN employees e ON e.telegram_id=s.employee_id
             JOIN jobs j ON j.id=s.job_id
@@ -440,6 +643,17 @@ def get_sessions_today():
     )
 
 
+def get_employee_sessions_today(emp_id):
+    """All sessions (any status) for an employee today in LA time."""
+    la_now    = get_la_now()
+    since_la  = la_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    since_utc = since_la.astimezone(timezone.utc)
+    since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
+    return _fetchall(
+        f"SELECT id FROM sessions WHERE employee_id={_ph()} AND start_time>={_ph()}",
+        emp_id, since)
+
+
 def get_employee_sessions_last_days(emp_id, days=7):
     """All sessions (open + closed) for this employee in the last N calendar days (LA time)."""
     la_now    = get_la_now()
@@ -447,7 +661,7 @@ def get_employee_sessions_last_days(emp_id, days=7):
     since_utc = since_la.astimezone(timezone.utc)
     since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
     return _fetchall(
-        f"""SELECT s.*, j.car FROM sessions s JOIN jobs j ON j.id=s.job_id
+        f"""SELECT s.*, j.car, j.year FROM sessions s JOIN jobs j ON j.id=s.job_id
             WHERE s.employee_id={_ph()} AND s.start_time>={_ph()}
             ORDER BY s.start_time""",
         emp_id, since)
@@ -470,8 +684,10 @@ def get_all_jobs_all():
 
 
 def get_job_session_count(job_id):
-    """Number of sessions (open or closed) for a job."""
-    row = _fetchone(f"SELECT COUNT(*) AS cnt FROM sessions WHERE job_id={_ph()}", job_id)
+    """Number of valid (> 0 min) sessions for a job."""
+    row = _fetchone(
+        f"SELECT COUNT(*) AS cnt FROM sessions "
+        f"WHERE job_id={_ph()} AND (duration_minutes > 0 OR end_time IS NULL)", job_id)
     return int(row["cnt"]) if row else 0
 
 
@@ -512,6 +728,25 @@ def fmt_time(val):
         return "—"
 
 
+def fmt_date(val):
+    """Format a UTC timestamp as 'May 18 at 9:30 AM'."""
+    try:
+        la_dt = _parse_dt(val).astimezone(LA_TZ)
+        h = la_dt.strftime("%I").lstrip("0") or "12"
+        return la_dt.strftime(f"%b %-d at {h}:%M %p")
+    except Exception:
+        return "—"
+
+
+def fmt_date_only(val):
+    """Format a UTC timestamp as 'May 18'."""
+    try:
+        la_dt = _parse_dt(val).astimezone(LA_TZ)
+        return la_dt.strftime("%b %-d")
+    except Exception:
+        return "—"
+
+
 def fmt_dur(minutes):
     if not minutes:
         return "0 min"
@@ -536,17 +771,14 @@ def live_dur(start_val):
 
 
 def parse_time_input(text, date_la=None):
-    """
-    Parse a clock time string entered by the admin (e.g. '5:30 PM' or '17:30')
-    as LA local time and return a UTC naive datetime string for DB storage.
-    If date_la (a date object) is given, uses that date; otherwise uses today in LA.
-    """
+    """Parse clock time string (e.g. '5:30 PM' or '17:30') as LA local time.
+    Returns UTC naive datetime string for DB storage, or None on failure."""
     text = text.strip().upper().replace(".", ":")
     if date_la is None:
         date_la = get_la_now().date()
     for fmt in ["%I:%M %p", "%H:%M", "%I%p", "%I %p"]:
         try:
-            t = datetime.strptime(text, fmt)
+            t      = datetime.strptime(text, fmt)
             la_dt  = datetime.combine(date_la, t.time(), tzinfo=LA_TZ)
             utc_dt = la_dt.astimezone(timezone.utc)
             return utc_dt.strftime("%Y-%m-%d %H:%M:%S")
