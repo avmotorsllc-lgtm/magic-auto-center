@@ -400,18 +400,18 @@ def get_open_session(job_id, emp_id):
 def get_employee_open_session_any(emp_id, exclude_job_id=None):
     if exclude_job_id:
         return _fetchone(
-            f"SELECT s.*,j.car,j.plate,j.year FROM sessions s JOIN jobs j ON j.id=s.job_id "
+            f"SELECT s.*,j.car,j.plate,j.year,j.color FROM sessions s JOIN jobs j ON j.id=s.job_id "
             f"WHERE s.employee_id={_ph()} AND s.end_time IS NULL AND s.job_id!={_ph()}",
             emp_id, exclude_job_id)
     return _fetchone(
-        f"SELECT s.*,j.car,j.plate,j.year FROM sessions s JOIN jobs j ON j.id=s.job_id "
+        f"SELECT s.*,j.car,j.plate,j.year,j.color FROM sessions s JOIN jobs j ON j.id=s.job_id "
         f"WHERE s.employee_id={_ph()} AND s.end_time IS NULL", emp_id)
 
 
 def get_employee_all_open_sessions(emp_id):
     """All currently open sessions for an employee."""
     return _fetchall(
-        f"""SELECT s.*,j.car,j.plate,j.year FROM sessions s JOIN jobs j ON j.id=s.job_id
+        f"""SELECT s.*,j.car,j.plate,j.year,j.color FROM sessions s JOIN jobs j ON j.id=s.job_id
             WHERE s.employee_id={_ph()} AND s.end_time IS NULL
             ORDER BY s.start_time""",
         emp_id)
@@ -419,7 +419,7 @@ def get_employee_all_open_sessions(emp_id):
 
 def get_all_open_sessions():
     return _fetchall("""
-        SELECT s.*,e.name AS emp_name,e.telegram_id,j.car,j.plate,j.id AS job_id,j.year
+        SELECT s.*,e.name AS emp_name,e.telegram_id,j.car,j.plate,j.id AS job_id,j.year,j.color
         FROM sessions s
         JOIN employees e ON e.telegram_id=s.employee_id
         JOIN jobs j ON j.id=s.job_id
@@ -541,7 +541,7 @@ def get_report_data(days=1):
     since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
 
     rows = _fetchall(
-        f"""SELECT s.*,e.name AS emp_name,j.car,j.plate,j.id AS job_id,j.year
+        f"""SELECT s.*,e.name AS emp_name,j.car,j.plate,j.id AS job_id,j.year,j.color
             FROM sessions s
             JOIN employees e ON e.telegram_id=s.employee_id
             JOIN jobs j ON j.id=s.job_id
@@ -551,9 +551,12 @@ def get_report_data(days=1):
 
     by_job = {}
     for r in rows:
-        jid = r["job_id"]
-        year = (r.get("year") or "").strip()
+        jid   = r["job_id"]
+        year  = (r.get("year")  or "").strip()
+        color = (r.get("color") or "").strip()
         car_display = f"{year} {r['car']}".strip() if year else r["car"]
+        if color:
+            car_display = f"{car_display} · {color}"
         by_job.setdefault(jid, {"car": car_display, "plate": r["plate"], "by_emp": {}, "total": 0})
         emp = r["emp_name"]
         by_job[jid]["by_emp"].setdefault(emp, {"rows": [], "total": 0})
@@ -571,7 +574,7 @@ def get_report_data_by_day(days=7):
     since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
 
     rows = _fetchall(
-        f"""SELECT s.*,e.name AS emp_name,j.car,j.plate,j.id AS job_id,j.year
+        f"""SELECT s.*,e.name AS emp_name,j.car,j.plate,j.id AS job_id,j.year,j.color
             FROM sessions s
             JOIN employees e ON e.telegram_id=s.employee_id
             JOIN jobs j ON j.id=s.job_id
@@ -584,8 +587,11 @@ def get_report_data_by_day(days=7):
         d = la_date(r["start_time"])
         if not d:
             continue
-        year = (r.get("year") or "").strip()
+        year  = (r.get("year")  or "").strip()
+        color = (r.get("color") or "").strip()
         car_display = f"{year} {r['car']}".strip() if year else r["car"]
+        if color:
+            car_display = f"{car_display} · {color}"
         jid = r["job_id"]
         emp = r["emp_name"]
         if d not in by_day:
@@ -618,7 +624,7 @@ def get_employee_week_hours(emp_id):
     since_utc = monday_la.astimezone(timezone.utc)
     since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
     return _fetchall(
-        f"""SELECT s.start_time, s.end_time, s.duration_minutes, s.job_id, j.car, j.year
+        f"""SELECT s.start_time, s.end_time, s.duration_minutes, s.job_id, j.car, j.year, j.color
             FROM sessions s JOIN jobs j ON j.id=s.job_id
             WHERE s.employee_id={_ph()} AND s.start_time>={_ph()}
               AND s.end_time IS NOT NULL AND s.duration_minutes > 0
@@ -633,7 +639,7 @@ def get_sessions_today():
     since_utc = since_la.astimezone(timezone.utc)
     since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
     return _fetchall(
-        f"""SELECT s.*,e.name AS emp_name,e.telegram_id,j.car,j.plate,j.id AS job_id,j.client,j.year
+        f"""SELECT s.*,e.name AS emp_name,e.telegram_id,j.car,j.plate,j.id AS job_id,j.client,j.year,j.color
             FROM sessions s
             JOIN employees e ON e.telegram_id=s.employee_id
             JOIN jobs j ON j.id=s.job_id
@@ -661,7 +667,7 @@ def get_employee_sessions_last_days(emp_id, days=7):
     since_utc = since_la.astimezone(timezone.utc)
     since     = since_utc.replace(tzinfo=None) if DATABASE_URL else since_utc.strftime("%Y-%m-%d %H:%M:%S")
     return _fetchall(
-        f"""SELECT s.*, j.car, j.year FROM sessions s JOIN jobs j ON j.id=s.job_id
+        f"""SELECT s.*, j.car, j.year, j.color FROM sessions s JOIN jobs j ON j.id=s.job_id
             WHERE s.employee_id={_ph()} AND s.start_time>={_ph()}
             ORDER BY s.start_time""",
         emp_id, since)
