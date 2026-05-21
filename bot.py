@@ -39,9 +39,9 @@ REPORT_HOUR     = int(os.environ.get("REPORT_HOUR",     "15"))
 BRAND = "🔧 Magic Auto Center"
 
 # Conversation states
-(ADD_JOB_ID, ADD_JOB_YEAR, ADD_JOB_CAR, ADD_JOB_PLATE, ADD_JOB_CLIENT,
+(ADD_JOB_ID, ADD_JOB_YEAR, ADD_JOB_CAR, ADD_JOB_COLOR, ADD_JOB_PLATE, ADD_JOB_CLIENT,
  WAITING_NAME, CONFIRM_NAME, EDITING_SESSION_TIME,
- EDIT_JOB_FIELD, RENAME_TECH, MY_NAME_STATE) = range(11)
+ EDIT_JOB_FIELD, RENAME_TECH, MY_NAME_STATE) = range(12)
 
 # ── Admin keyboard ─────────────────────────────────────────────────────────────
 ADMIN_KB = ReplyKeyboardMarkup([
@@ -85,10 +85,12 @@ def escape_md(text) -> str:
 
 
 def _car_display(job) -> str:
-    """Return 'Year Make/Model' or just 'Make/Model' if no year."""
-    year = (job.get("year") or "").strip()
-    car  = (job.get("car")  or "").strip()
-    return f"{year} {car}".strip() if year else car
+    """Return 'Year Make/Model · Color' (omits any part that is empty)."""
+    year  = (job.get("year")  or "").strip()
+    car   = (job.get("car")   or "").strip()
+    color = (job.get("color") or "").strip()
+    base  = f"{year} {car}".strip() if year else car
+    return f"{base} · {color}" if color else base
 
 
 async def send_safe(send_fn, text: str, **kwargs):
@@ -520,7 +522,7 @@ async def cmd_addjob(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     ctx.user_data.pop("new_job", None)
     await update.message.reply_text(
-        "*New Repair Order*\n\nStep 1/5 — RO number:\n_(e.g. RO-1043)_\n\n"
+        "*New Repair Order*\n\nStep 1/6 — RO number:\n_(e.g. RO-1043)_\n\n"
         "_Type /cancel to stop._",
         parse_mode="Markdown", reply_markup=ADMIN_KB,
     )
@@ -557,7 +559,7 @@ async def addjob_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     la_now = db.get_la_now()
     await update.message.reply_text(
         f"✅ {escape_md(job_id)}\n\n"
-        f"Step 2/5 — Vehicle year:\n_(e.g. {la_now.year})_\n_(Required — cannot skip)_",
+        f"Step 2/6 — Vehicle year:\n_(e.g. {la_now.year})_\n_(Required — cannot skip)_",
         parse_mode="Markdown", reply_markup=ADMIN_KB)
     return ADD_JOB_YEAR
 
@@ -584,7 +586,7 @@ async def addjob_year(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ADD_JOB_YEAR
     ctx.user_data["new_job"]["year"] = text
     await update.message.reply_text(
-        "Step 3/5 — Make & model:\n_(e.g. Mazda CX-30)_\n_(Required — cannot skip)_",
+        "Step 3/6 — Make & model:\n_(e.g. Mazda CX-30)_\n_(Required — cannot skip)_",
         parse_mode="Markdown", reply_markup=ADMIN_KB)
     return ADD_JOB_CAR
 
@@ -608,7 +610,26 @@ async def addjob_car(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ADD_JOB_CAR
     ctx.user_data["new_job"]["car"] = text
     await update.message.reply_text(
-        "Step 4/5 — License plate:\n_(or /skip)_",
+        "Step 4/6 — Car color:\n_(e.g. Grey, White, Blue)_\n_(or /skip)_",
+        parse_mode="Markdown", reply_markup=ADMIN_KB)
+    return ADD_JOB_COLOR
+
+
+async def addjob_color(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text in BUTTON_LABELS:
+        await _dispatch_button(update, ctx, text)
+        return ConversationHandler.END
+    if _is_cancel(text):
+        ctx.user_data.pop("new_job", None)
+        await update.message.reply_text("❌ Cancelled.", reply_markup=ADMIN_KB)
+        return ConversationHandler.END
+    if len(text) > 50:
+        await update.message.reply_text("❌ Too long. Max 50 characters.", reply_markup=ADMIN_KB)
+        return ADD_JOB_COLOR
+    ctx.user_data["new_job"]["color"] = "" if text.lower() == "/skip" else text.title()
+    await update.message.reply_text(
+        "Step 5/6 — License plate:\n_(or /skip)_",
         parse_mode="Markdown", reply_markup=ADMIN_KB)
     return ADD_JOB_PLATE
 
@@ -627,7 +648,7 @@ async def addjob_plate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ADD_JOB_PLATE
     ctx.user_data["new_job"]["plate"] = "" if text.lower() == "/skip" else text.upper()
     await update.message.reply_text(
-        "Step 5/5 — Customer name:\n_(or /skip)_",
+        "Step 6/6 — Customer name:\n_(or /skip)_",
         parse_mode="Markdown", reply_markup=ADMIN_KB)
     return ADD_JOB_CLIENT
 
@@ -647,14 +668,16 @@ async def addjob_client(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     j = ctx.user_data.pop("new_job", {})
     j["client"] = "" if text.lower() == "/skip" else text
     db.add_job(j["id"], j["car"], j.get("plate", ""), j.get("client", ""),
-               year=j.get("year", ""))
-    car_display = f"{j.get('year', '')} {j['car']}".strip()
+               color=j.get("color", ""), year=j.get("year", ""))
+    car_display = _car_display(j)  # includes year · color if set
     qr_link = f"https://t.me/{BOT_USERNAME}?start={j['id']}"
     lines = [
         f"✅ *Job created!*\n",
         f"📋 *{escape_md(j['id'])}*",
-        f"🚗 {escape_md(car_display)}  ·  {escape_md(j.get('plate') or '—')}",
+        f"🚗 {escape_md(car_display)}",
     ]
+    if j.get("plate"):
+        lines.append(f"🔖 {escape_md(j['plate'])}")
     if j.get("client"):
         lines.append(f"👤 {escape_md(j['client'])}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=ADMIN_KB)
@@ -2148,6 +2171,7 @@ def run():
             ADD_JOB_ID:     [MessageHandler(_no_cmd, addjob_id),     CommandHandler("skip", addjob_id)],
             ADD_JOB_YEAR:   [MessageHandler(_no_cmd, addjob_year),   CommandHandler("skip", addjob_year)],
             ADD_JOB_CAR:    [MessageHandler(_no_cmd, addjob_car),    CommandHandler("skip", addjob_car)],
+            ADD_JOB_COLOR:  [MessageHandler(_no_cmd, addjob_color),  CommandHandler("skip", addjob_color)],
             ADD_JOB_PLATE:  [MessageHandler(_no_cmd, addjob_plate),  CommandHandler("skip", addjob_plate)],
             ADD_JOB_CLIENT: [MessageHandler(_no_cmd, addjob_client), CommandHandler("skip", addjob_client)],
         },
